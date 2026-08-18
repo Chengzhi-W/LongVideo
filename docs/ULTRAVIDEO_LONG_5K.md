@@ -90,8 +90,12 @@ python tools/build_ultravideo_long_lmdb.py \
 
 The existing `LatentLMDBDataset` can read this schema. A true long-history AR
 teacher must also increase the wrapper sequence capacity and train through the
-63-latent teacher-forcing mask. This repository provides both a one-GPU smoke
-configuration and the intended two-node/16-GPU 2K-step configuration.
+63-latent teacher-forcing mask. The mask matches the rolling inference cache:
+for each mature three-latent target chunk it exposes `sink3 + recent15` clean
+history plus the current three noisy latents, all at their absolute positions on
+the 63-latent timeline. It does not expose the complete preceding video. This
+repository provides both a one-GPU smoke configuration and the intended
+two-node/16-GPU configuration.
 
 ## 6. One-GPU end-to-end smoke test
 
@@ -107,8 +111,8 @@ bash tools/run_ar_teacher_ultravideo_long_smoke_1gpu.sh
 ```
 
 Success requires two optimizer steps, two nonempty checkpoints, a clean
-`max_steps=2` exit, and no OOM/NaN/traceback. This is a code-path test, not a
-quality experiment.
+`max_steps=2` exit, a passing `SINK_RECENT_TEACHER_FORCING_AUDIT_OK`, and no
+OOM/NaN/traceback. This is a code-path test, not a quality experiment.
 
 ## 7. Production 2K-step fine-tune
 
@@ -127,7 +131,8 @@ NODE_RANK=1 MASTER_ADDR=<machine-0-ip> \
 
 The production configuration is
 `configs/ar_teacher_ultravideo_long_5k_63f_2k.yaml`: seed 42, 63 latents,
-full causal history, batch 1 per GPU and effective global batch 16. It is
+`sink3 + recent15 + current3` rolling attention, batch 1 per GPU and effective
+global batch 16. It is
 open-ended and saves every 100 steps; 2K is only the planned observation point,
 and the operator decides when to stop. The trainer rejects a world-size/global-
 batch mismatch rather than silently changing the optimization protocol.
@@ -138,6 +143,29 @@ Blackwell host: the fixed default Triton schedule exceeded per-block shared
 resources, while autotuning selected valid, mathematically equivalent forward
 and backward FlexAttention kernels. It may be overridden explicitly on a
 known-good older cluster.
+
+## 8. First downstream DMD run
+
+After selecting a fine-tuned teacher checkpoint, install it at the stable path
+used by the DMD config:
+
+```bash
+cp <selected-ar-teacher-model.pt> \
+  checkpoints/chunkwise/ar_diffusion_long_sink_recent.pt
+```
+
+The first controlled student experiment uses:
+
+```text
+configs/causal_forcing_dmd_chunkwise_long_ar_teacher_mem1_ungated.yaml
+```
+
+It replays the real student prefix through the teacher's finite cache at its
+absolute RoPE positions. Cache eviction leaves `sink3 + recent15` before the
+current noisy chunk, and mem1 compares that prediction with the teacher's
+genuine empty-history prediction. This configuration deliberately contains no
+`memory_max_timestep` and no Long-vs-Local branch. Test those only as later,
+separate ablations if the basic tuned-teacher experiment is unsatisfactory.
 
 ## Storage and publishing boundary
 

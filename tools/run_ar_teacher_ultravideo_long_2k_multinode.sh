@@ -34,6 +34,7 @@ done
 mkdir -p "$LOGDIR/wandb"
 
 cd "$BASE"
+"$PYTHON" tools/audit_sink_recent_teacher_forcing.py --config "$CONFIG"
 "$PYTHON" -m torch.distributed.run \
   --nproc_per_node="$NPROC_PER_NODE" \
   --nnodes="$NNODES" \

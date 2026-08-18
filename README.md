@@ -11,8 +11,9 @@
 [![Status](https://img.shields.io/badge/Status-Research--in--progress-E74C3C)](#project-status)
 
 This repository contains our long-video research stack built on Causal Forcing:
-long-history AR-teacher fine-tuning, Memory-DMD, the **Long-vs-Local (A18−A6)**
-memory control, 15-second inference, and locked VBench reproduction tools.
+sink/recent long-AR-teacher fine-tuning, ungated Memory-DMD, the experimental
+**Long-vs-Local (A18−A6)** control, 15-second inference, and locked VBench
+reproduction tools.
 
 [Method](#method) · [Quick start](#quick-start) · [AR teacher](#long-history-ar-teacher) ·
 [DMD experiments](#memory-dmd-experiments) · [Evaluation](#evaluation) ·
@@ -35,6 +36,20 @@ Our goal is to improve long-range identity and scene consistency **without
 turning the video into a static continuation of its recent state**.
 
 ## Method
+
+### Current training path
+
+The first controlled experiment is intentionally minimal:
+
+1. fine-tune the AR teacher with `sink3 + recent15 + current3` on a 63-latent
+   timeline;
+2. freeze that teacher and train the student with the original mem1
+   history-vs-empty residual at every DMD timestep;
+3. do **not** enable `t < 750` gating or Long-vs-Local in this main run.
+
+Long-vs-Local remains an AR-teacher-finetuning-free mechanism experiment and a
+fallback ablation. It is not completely training-free because the student still
+requires DMD training when that residual is used.
 
 ### 1. Memory-DMD baseline
 
@@ -103,7 +118,8 @@ flowchart LR
 - [x] Build deterministic UltraVideo-Long 5K download and preprocessing.
 - [x] Pass a real-data, one-GPU, two-step AR-teacher smoke test.
 - [ ] Fine-tune the long-history AR teacher on the full 5K subset.
-- [ ] Re-run baseline, A18−A0, and A18−A6 DMD from the new teacher.
+- [ ] Run ungated mem1 from the new sink/recent AR teacher.
+- [ ] Keep A18−A6 and `t < 750` as separate fallback ablations.
 - [ ] Select the final consistency–dynamics operating point.
 
 ## Quick start
@@ -145,11 +161,19 @@ The full operator guide is
 [`docs/ULTRAVIDEO_LONG_5K.md`](docs/ULTRAVIDEO_LONG_5K.md). The commands below
 are the shortest safe path.
 
+The teacher is fine-tuned on a 63-latent timeline with the same bounded cache
+used at inference. Each mature three-latent target chunk attends to the first
+three latent frames (the attention sink), the immediately preceding 15 latent
+frames, and its own three noisy frames: `sink3 + recent15 + current3`. Absolute
+RoPE positions are preserved across the full timeline; this is not full-history
+attention.
+
 ### One-GPU preflight
 
 The smoke test keeps all 63 latent frames while reducing spatial resolution.
 It validates real video decoding, VAE encoding, LMDB loading, model loading,
-forward/backward, optimizer updates, and checkpoint serialization.
+the exact sink/recent attention topology, forward/backward, optimizer updates,
+and checkpoint serialization.
 
 ```bash
 DEBUG_COUNT=4 bash tools/ultravideo_long_5k.sh debug-download
@@ -199,6 +223,7 @@ paths.
 |---|---|---:|---|
 | Baseline | none | — | `configs/causal_forcing_dmd_chunkwise_senior_baseline.yaml` |
 | Senior mem1 | A18−A0 | none | `configs/causal_forcing_dmd_chunkwise_senior_mem1_nonorm.yaml` |
+| **Long-teacher mem1 (main)** | A_sink+recent−A0 | **none** | `configs/causal_forcing_dmd_chunkwise_long_ar_teacher_mem1_ungated.yaml` |
 | Long-vs-Local | A18−A6 | none | `configs/causal_forcing_dmd_chunkwise_long_vs_local_joint_nogate_step1500.yaml` |
 | Long-vs-Local gated | A18−A6 | `t < 750` | `configs/causal_forcing_dmd_chunkwise_long_vs_local_joint_t750.yaml` |
 | Gated open-ended | A18−A6 | `t < 750` | `configs/causal_forcing_dmd_chunkwise_long_vs_local_joint_t750_openended.yaml` |

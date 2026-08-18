@@ -78,6 +78,15 @@ class DMD(SelfForcingModel):
             # Re-based window layout: sink frames (placed at re-based pos [0, n_sink-1]).
             # recent = 21 - n_sink - block fills the rest before the noisy chunk.
             self.memory_sink_frames = int(getattr(args, "memory_sink_frames", 3))
+            # ``rebased`` preserves the original five-second teacher protocol.
+            # ``rolling_sink_recent`` replays the real student prefix at absolute
+            # positions through a finite KV cache; eviction then leaves precisely
+            # sink + recent before the current chunk, matching the long AR teacher.
+            self.memory_history_layout = str(
+                getattr(args, "memory_history_layout", "rebased"))
+            if self.memory_history_layout not in ("rebased", "rolling_sink_recent"):
+                raise ValueError(
+                    f"Unknown memory_history_layout: {self.memory_history_layout}")
             # Timestep gating: only apply the memory term when the DMD noise level
             # (timestep) is BELOW this threshold. Rationale: high-t (high-noise) steps
             # decide global structure & large motion; low-t (low-noise) steps refine
@@ -240,14 +249,41 @@ class DMD(SelfForcingModel):
                         history_start + c, conditional_dict)
                 chunk_pos = n_recent
             elif tag in ("full", "hist"):
-                kv, cross = self._ar_empty_cache(B, 21)
-                # Commit sink at re-based pos [0..s-1], then recent at [s..s+r-1], and
-                # predict the chunk right after, at re-based pos [s+r .. s+r+block-1].
-                for src_full, base in ((sink, 0), (recent, s)):
-                    for c in range(0, src_full.shape[1], block):
-                        blk = src_full[:, c:c + block]
-                        self._ar_commit(blk, kv, cross, base + c, conditional_dict)
-                chunk_pos = s + r
+                if self.memory_history_layout == "rolling_sink_recent":
+                    if control_type != "empty":
+                        raise ValueError(
+                            "rolling_sink_recent is defined only for the mem1 "
+                            "history-vs-empty control")
+                    local = int(getattr(self.ar_teacher.model, "local_attn_size", -1))
+                    teacher_sink = int(getattr(self.ar_teacher.model, "sink_size", 0))
+                    expected_local = n_sink + n_recent + block
+                    if local != expected_local or teacher_sink != n_sink:
+                        raise ValueError(
+                            "Long AR teacher cache must match mem1 geometry: "
+                            f"local_attn_size={local} (expected {expected_local}), "
+                            f"sink_size={teacher_sink} (expected {n_sink})")
+
+                    # Replay the actual student prefix in chronological order.  The
+                    # finite cache performs the same eviction as deployment, keeping
+                    # the first sink frames and the latest recent frames.  Crucially,
+                    # all commits and the query retain their absolute 0..62 RoPE.
+                    kv, cross = self._ar_empty_cache(B, num_frames_full)
+                    prefix = student_full[:, :chunk_abs_start]
+                    for c in range(0, prefix.shape[1], block):
+                        self._ar_commit(
+                            prefix[:, c:c + block], kv, cross, c,
+                            conditional_dict)
+                    chunk_pos = chunk_abs_start
+                else:
+                    kv, cross = self._ar_empty_cache(B, 21)
+                    # Legacy five-second teacher: rebase sink and recent contiguously
+                    # to positions 0..17, then predict the current chunk at 18..20.
+                    for src_full, base in ((sink, 0), (recent, s)):
+                        for c in range(0, src_full.shape[1], block):
+                            blk = src_full[:, c:c + block]
+                            self._ar_commit(
+                                blk, kv, cross, base + c, conditional_dict)
+                    chunk_pos = s + r
             else:  # senior no-history control
                 kv, cross = self._ar_empty_cache(B, 21)
                 # nohist = the teacher's genuine NO-HISTORY prior: empty cache, predict
