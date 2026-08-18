@@ -119,7 +119,9 @@ class WanDiffusionWrapper(torch.nn.Module):
             timestep_shift=8.0,
             is_causal=False,
             local_attn_size=-1,
-            sink_size=0
+            sink_size=0,
+            max_num_frames=21,
+            frame_seq_length=1560,
     ):
         super().__init__()
 
@@ -138,7 +140,14 @@ class WanDiffusionWrapper(torch.nn.Module):
         )
         self.scheduler.set_timesteps(1000, training=True)
 
-        self.seq_len = 32760  # [1, 21, 16, 60, 104]
+        # One 480x832 latent frame has (60/2)*(104/2)=1560 patch tokens.
+        # Keep the historical 21-frame default, but make the capacity explicit
+        # so a 63-latent AR teacher cannot silently reuse a 5-second limit.
+        self.max_num_frames = int(max_num_frames)
+        self.frame_seq_length = int(frame_seq_length)
+        if self.max_num_frames <= 0 or self.frame_seq_length <= 0:
+            raise ValueError("max_num_frames and frame_seq_length must be positive")
+        self.seq_len = self.max_num_frames * self.frame_seq_length
         self.post_init()
 
     def enable_gradient_checkpointing(self) -> None:
@@ -221,15 +230,29 @@ class WanDiffusionWrapper(torch.nn.Module):
         timestep: torch.Tensor, kv_cache: Optional[List[dict]] = None,
         crossattn_cache: Optional[List[dict]] = None,
         current_start: Optional[int] = None,
-        
+
         classify_mode: Optional[bool] = False, # DF
         concat_time_embeddings: Optional[bool] = False, #DF
         clean_x: Optional[torch.Tensor] = None, # TF
         aug_t: Optional[torch.Tensor] = None, # for TF clean GT, if it's also noisy and needs denoising by the model, aug_t is its timestep
-        
+
         cache_start: Optional[int] = None
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
+
+        patch_h, patch_w = self.model.patch_size[1:]
+        _, num_frames, _, height, width = noisy_image_or_video.shape
+        actual_frame_seq = ((height + patch_h - 1) // patch_h) * (
+            (width + patch_w - 1) // patch_w
+        )
+        required_seq_len = num_frames * actual_frame_seq
+        if required_seq_len > self.seq_len:
+            raise RuntimeError(
+                "Input exceeds configured Wan sequence capacity: "
+                f"{num_frames} frames * {actual_frame_seq} tokens/frame = "
+                f"{required_seq_len} > {self.seq_len}. Set model_kwargs.max_num_frames "
+                "and model_kwargs.frame_seq_length for this training resolution."
+            )
 
         # [B, F] -> [B]
         if self.uniform_timestep:

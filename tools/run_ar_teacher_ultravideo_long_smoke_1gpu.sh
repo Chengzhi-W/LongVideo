@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE="${BASE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+PYTHON="${PYTHON:-python}"
+CONFIG="$BASE/configs/ar_teacher_ultravideo_long_smoke_63f_1gpu.yaml"
+LOGDIR="${LOGDIR:-$BASE/logs/ar_teacher_ultravideo_long_smoke_63f_1gpu_seed42}"
+PORT="${MASTER_PORT:-29631}"
+
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export PYTHONPATH="$BASE"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export PYTHONUNBUFFERED=1
+# Blackwell may reject the first default FlexAttention Triton schedule because
+# it exceeds per-block shared resources. Autotuning lets Inductor select a
+# valid smaller schedule without changing the attention math.
+export WAN_FLEX_COMPILE_MODE="${WAN_FLEX_COMPILE_MODE:-max-autotune-no-cudagraphs}"
+
+for path in \
+  "$CONFIG" \
+  "$BASE/checkpoints/chunkwise/ar_diffusion.pt" \
+  "$BASE/dataset/UltraVideo-Long-debug/clean_data_63_240x416"; do
+  [[ -e "$path" ]] || { echo "MISSING_REQUIRED_PATH:$path" >&2; exit 1; }
+done
+
+[[ ! -e "$LOGDIR" ]] || {
+  echo "REFUSE_TO_OVERWRITE_EXISTING_SMOKE:$LOGDIR" >&2
+  exit 1
+}
+mkdir -p "$LOGDIR"
+
+cd "$BASE"
+"$PYTHON" -m torch.distributed.run \
+  --nproc_per_node=1 \
+  --nnodes=1 \
+  --node_rank=0 \
+  --master_addr=127.0.0.1 \
+  --master_port="$PORT" \
+  train.py \
+  --config_path "$CONFIG" \
+  --logdir "$LOGDIR" \
+  --wandb-save-dir "$LOGDIR/wandb" \
+  --disable-wandb \
+  --no_visualize \
+  2>&1 | tee "$LOGDIR/train.log"
+
+for step in 000001 000002; do
+  [[ -s "$LOGDIR/checkpoint_model_${step}/model.pt" ]] || {
+    echo "MISSING_SMOKE_CHECKPOINT:step=$step" >&2
+    exit 1
+  }
+done
+grep -q 'Reached max_steps=2' "$LOGDIR/train.log" || {
+  echo "SMOKE_DID_NOT_REACH_MAX_STEPS" >&2
+  exit 1
+}
+echo "AR_TEACHER_LONG_SMOKE_COMPLETE:$LOGDIR"

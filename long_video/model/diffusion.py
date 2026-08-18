@@ -28,10 +28,11 @@ class CausalDiffusion(BaseModel):
         self.guidance_scale = args.guidance_scale
         self.timestep_shift = getattr(args, "timestep_shift", 1.0)
         self.teacher_forcing = getattr(args, "teacher_forcing", False)
+        
         # Noise augmentation in teacher forcing, we add small noise to clean context latents
         self.noise_augmentation_max_timestep = getattr(args, "noise_augmentation_max_timestep", 0)
 
-    def _initialize_models(self, args):
+    def _initialize_models(self, args, device):
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         self.generator.model.requires_grad_(True)
 
@@ -40,6 +41,9 @@ class CausalDiffusion(BaseModel):
 
         self.vae = WanVAEWrapper()
         self.vae.requires_grad_(False)
+        
+        self.scheduler = self.generator.get_scheduler()
+        self.scheduler.timesteps = self.scheduler.timesteps.to(device)
 
     def generator_loss(
         self,
@@ -86,8 +90,8 @@ class CausalDiffusion(BaseModel):
         # Step 3: Noise augmentation, also add small noise to clean context latents
         if self.noise_augmentation_max_timestep > 0:
             index_clean_aug = self._get_timestep(
-                0,
                 self.noise_augmentation_max_timestep,
+                1000,
                 image_or_video_shape[0],
                 image_or_video_shape[1],
                 self.num_frame_per_block,
@@ -102,8 +106,9 @@ class CausalDiffusion(BaseModel):
         else:
             clean_latent_aug = clean_latent
             timestep_clean_aug = None
-
         # Compute loss
+        
+        
         flow_pred, x0_pred = self.generator(
             noisy_image_or_video=noisy_latents,
             conditional_dict=conditional_dict,

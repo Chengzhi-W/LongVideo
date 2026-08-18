@@ -1,5 +1,6 @@
 import argparse
 import os
+import torch.distributed as dist
 from omegaconf import OmegaConf
 import wandb
 
@@ -15,6 +16,10 @@ def main():
     parser.add_argument("--logdir", type=str, default="", help="Path to the directory to save logs")
     parser.add_argument("--wandb-save-dir", type=str, default="", help="Path to the directory to save wandb logs")
     parser.add_argument("--disable-wandb", action="store_true")
+    parser.add_argument(
+        "--memory-diagnostic-only", action="store_true",
+        help="Run the no-update A18-A0 versus A18-A6 target-motion diagnostic and exit.")
+    parser.add_argument("--memory-diagnostic-chunks", type=int, default=200)
     parser.add_argument("--tf", action="store_true")
 
     args = parser.parse_args()
@@ -31,6 +36,10 @@ def main():
     config.logdir = args.logdir
     config.wandb_save_dir = args.wandb_save_dir
     config.disable_wandb = args.disable_wandb
+    if args.memory_diagnostic_only:
+        config.memory_diagnostic_only = True
+        config.memory_diagnostic_compare_empty = True
+        config.memory_diagnostic_chunks = args.memory_diagnostic_chunks
 
     if config.trainer == "diffusion":
         trainer = DiffusionTrainer(config)
@@ -43,6 +52,8 @@ def main():
     trainer.train()
 
     wandb.finish()
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -142,7 +142,8 @@ class CausalInferencePipeline(torch.nn.Module):
             self._initialize_kv_cache(
                 batch_size=batch_size,
                 dtype=noise.dtype,
-                device=noise.device
+                device=noise.device,
+                num_frames=num_output_frames
             )
             self._initialize_crossattn_cache(
                 batch_size=batch_size,
@@ -334,7 +335,7 @@ class CausalInferencePipeline(torch.nn.Module):
         else:
             return video
 
-    def _initialize_kv_cache(self, batch_size, dtype, device):
+    def _initialize_kv_cache(self, batch_size, dtype, device, num_frames=None):
         """
         Initialize a Per-GPU KV cache for the Wan model.
         """
@@ -342,6 +343,11 @@ class CausalInferencePipeline(torch.nn.Module):
         if self.local_attn_size != -1:
             # Use the local attention size to compute the KV cache size
             kv_cache_size = self.local_attn_size * self.frame_seq_length
+        elif num_frames is not None:
+            # local_attn_size == -1 means "no eviction": match training, where the
+            # cache holds the whole rollout (here num_frames) so attention can see
+            # the full contiguous history up to its 21-frame window.
+            kv_cache_size = num_frames * self.frame_seq_length
         else:
             # Use the default KV cache size
             kv_cache_size = 32760

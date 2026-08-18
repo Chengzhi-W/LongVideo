@@ -2,7 +2,7 @@ import gc
 import logging
 from utils.dataset import cycle
 from utils.dataset import TextDataset
-from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
+from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job, barrier
 from utils.misc import set_seed
 import torch.distributed as dist
 from omegaconf import OmegaConf
@@ -11,6 +11,7 @@ import torch
 import wandb
 import time
 import os
+import json
 
 
 class Trainer:
@@ -41,12 +42,16 @@ class Trainer:
         set_seed(config.seed + global_rank)
 
         if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=config.wandb_host, key=config.wandb_key)
+            # Prefer an environment credential for reproduction runs so the API key
+            # does not need to be duplicated into a new YAML file.
+            wandb.login(
+                host=config.wandb_host,
+                key=getattr(config, "wandb_key", None) or os.environ.get("WANDB_API_KEY")
+            )
             wandb.init(
                 config=OmegaConf.to_container(config, resolve=True),
-                name=config.config_name,
-                mode="online",
-                entity=config.wandb_entity,
+                name=config.logdir,
+                entity=getattr(config, "wandb_entity", None),
                 project=config.wandb_project,
                 dir=config.wandb_save_dir
             )
@@ -85,6 +90,16 @@ class Trainer:
             wrap_strategy=config.fake_score_fsdp_wrap_strategy,
             cpu_offload=False
         )
+
+        # Frozen AR teacher for memory-aware DMD (only when enabled; never optimized).
+        if getattr(config, "use_memory_dmd", False):
+            self.model.ar_teacher = fsdp_wrap(
+                self.model.ar_teacher,
+                sharding_strategy=config.sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=getattr(config, "ar_teacher_fsdp_wrap_strategy", "size"),
+                cpu_offload=False
+            )
 
         self.model.text_encoder = fsdp_wrap(
             self.model.text_encoder,
@@ -175,6 +190,17 @@ class Trainer:
                 state_dict, strict=True
             )
 
+        # Load the frozen AR teacher (memory-aware DMD).
+        if getattr(config, "use_memory_dmd", False) and getattr(config, "ar_teacher_ckpt", False):
+            print(f"Loading AR teacher from {config.ar_teacher_ckpt}")
+            ar_sd = torch.load(config.ar_teacher_ckpt, map_location="cpu")
+            for key in ("generator", "generator_ema", "model"):
+                if key in ar_sd:
+                    ar_sd = ar_sd[key]
+                    break
+            ar_sd = {k.replace("model._fsdp_wrapped_module.", "model.", 1): v for k, v in ar_sd.items()}
+            self.model.ar_teacher.load_state_dict(ar_sd, strict=True)
+
         ##############################################################################################################
 
         # Let's delete EMA params for early steps to save some computes at training and inference
@@ -225,7 +251,116 @@ class Trainer:
                        f"checkpoint_model_{self.step:06d}", "model.pt"))
             print("Model saved to", os.path.join(self.output_path,
                   f"checkpoint_model_{self.step:06d}", "model.pt"))
-            
+
+    @torch.no_grad()
+    def _save_latents_mp4(self, latents, path, fps=16):
+        """VAE-decode clean latents [B, F, C, H, W] (first sample) and write an mp4
+        (falls back to per-frame PNGs if the video writer is unavailable)."""
+        import numpy as np
+        video = self.model.vae.decode_to_pixel(latents.to(self.dtype))  # [B, F, C, H, W] ~[-1,1]
+        video = (video * 0.5 + 0.5).clamp(0, 1)
+        frames = (video[0].permute(0, 2, 3, 1).float().cpu().numpy() * 255.0)
+        frames = np.clip(frames, 0, 255).astype(np.uint8)  # [F, H, W, C]
+        try:
+            import imageio.v2 as imageio
+            writer = imageio.get_writer(path, fps=fps, codec="libx264",
+                                        quality=8, macro_block_size=None)
+            for f in frames:
+                writer.append_data(f)
+            writer.close()
+        except Exception:
+            import cv2
+            os.makedirs(path + "_frames", exist_ok=True)
+            for i, f in enumerate(frames):
+                cv2.imwrite(os.path.join(path + "_frames", f"{i:03d}.png"), f[:, :, ::-1])
+        print(f"[vis] rollout ({frames.shape[0]} frames) -> {path}")
+
+    @torch.no_grad()
+    def _visualize_demo(self):
+        """Comparable demo visualization: every `vis_iters` steps, generate a
+        FULL-length (num_training_frames) video for a FIXED prompt using a FIXED init
+        noise and FULL denoising (last_step_only), then upload to wandb. Same prompt +
+        noise every step and across runs -> directly comparable over training.
+
+        Distributed: the pipeline runs the FSDP generator and calls dist.broadcast
+        internally, so EVERY rank must execute the pipeline call in lockstep or the
+        collectives deadlock. We therefore have every rank render prompt (rank %
+        n_prompts) with the SAME per-prompt noise seed, so ranks that share a prompt
+        produce identical clips; rank 0 then uploads one clip per distinct prompt.
+        `inference_pipeline` is lazily initialized during training rollouts, which all
+        ranks run together, so `pipe is None` is consistent across ranks (no partial
+        participation)."""
+        rank = dist.get_rank()
+
+        # Cache the full prompt pool once; RE-SAMPLE k prompts every eval so we see
+        # diversity (a different batch each step). Seed = vis_seed + step, so the same
+        # step still picks the SAME prompts across runs (cross-run comparability kept;
+        # only cross-step comparability is dropped). Set vis_fixed_prompts: true to
+        # freeze the same k prompts across all steps instead.
+        allp = getattr(self, "_vis_prompt_pool", None)
+        if allp is None:
+            path = getattr(self.config, "vis_prompt_path", "prompts/demos.txt")
+            with open(path) as f:
+                allp = [l.strip() for l in f if l.strip()]
+            self._vis_prompt_pool = allp
+        k = int(getattr(self.config, "vis_num_prompts", 8))
+        base_seed = int(getattr(self.config, "vis_seed", 0))
+        fixed = bool(getattr(self.config, "vis_fixed_prompts", False))
+        sample_seed = base_seed if fixed else base_seed + self.step
+        g = torch.Generator().manual_seed(sample_seed)
+        idx = torch.randperm(len(allp), generator=g)[:k].tolist()
+        prompts = [allp[i] for i in idx]
+        n_prompts = len(prompts)
+
+        pipe = getattr(self.model, "inference_pipeline", None)
+        if pipe is None:
+            # Pipeline not built yet (only before the first training rollout). All
+            # ranks see None together, so returning here keeps them in lockstep.
+            return
+
+        # Which prompt THIS rank renders (all ranks participate -> collectives stay
+        # synced). Prompt index is deterministic from rank, seeded noise is keyed to
+        # the prompt index so duplicate renders across ranks are identical.
+        p_idx = rank % n_prompts
+        my_prompt = prompts[p_idx]
+        shape = list(self.config.image_or_video_shape)
+        shape[0] = 1
+        shape[1] = self.model.num_training_frames  # full length (63 = 15s)
+        gen = torch.Generator(device=self.device).manual_seed(
+            1234 + p_idx + int(getattr(self.config, "vis_seed", 0)))
+        noise = torch.randn(shape, generator=gen, device=self.device, dtype=self.dtype)
+        cond = self.model.text_encoder(text_prompts=[my_prompt])
+
+        prev_lso = pipe.last_step_only
+        pipe.last_step_only = True  # full denoising -> clean deterministic output
+        try:
+            out = pipe.inference_with_trajectory(noise=noise, **cond)
+        finally:
+            pipe.last_step_only = prev_lso
+        latents = out[0] if isinstance(out, tuple) else out
+
+        # Only the FIRST rank that owns each prompt writes it (avoids duplicate writes
+        # from ranks sharing a prompt); the VAE decode is local (no collectives).
+        if rank < n_prompts:
+            demo_dir = os.path.join(self.output_path, "demo_vis", f"prompt{p_idx}")
+            os.makedirs(demo_dir, exist_ok=True)
+            self._save_latents_mp4(latents, os.path.join(demo_dir, f"step{self.step:06d}.mp4"), fps=16)
+
+        barrier()
+
+        if self.is_main_process and not self.disable_wandb:
+            video_logs = {}
+            for r in range(n_prompts):
+                p = os.path.join(self.output_path, "demo_vis", f"prompt{r}", f"step{self.step:06d}.mp4")
+                if not os.path.exists(p):
+                    continue
+                try:
+                    video_logs[f"demo/prompt{r}"] = wandb.Video(p, fps=16, format="mp4")
+                except Exception as e:
+                    print(f"[demo-vis] failed to upload {p}: {e}")
+            if video_logs:
+                wandb.log(video_logs, step=self.step)
+
     def fwdbwd_one_step(self, batch, train_generator, clean_latent=None):
         self.model.eval()  # prevent any randomness (e.g. dropout)
 
@@ -299,9 +434,15 @@ class Trainer:
 
         return critic_log_dict
 
-
     def train(self):
+        if bool(getattr(self.config, "memory_diagnostic_only", False)):
+            self.run_memory_diagnostic()
+            return
+
         start_step = self.step
+        configured_save_steps = getattr(self.config, "save_steps", None)
+        save_steps = ({int(step) for step in configured_save_steps}
+                      if configured_save_steps else None)
        
         while True:
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
@@ -309,7 +450,7 @@ class Trainer:
             # Train the generator
             if TRAIN_GENERATOR:
                 self.generator_optimizer.zero_grad(set_to_none=True)
-                
+
                 batch = next(self.dataloader)
                 generator_log_dict = self.fwdbwd_one_step(batch, True)
 
@@ -336,10 +477,18 @@ class Trainer:
                 self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
 
             # Save the model
-            if (not self.config.no_save) and (self.step - start_step) > 0 and self.step % self.config.log_iters == 0:
+            should_save = (self.step in save_steps) if save_steps is not None else \
+                (self.step % self.config.log_iters == 0)
+            if (not self.config.no_save) and (self.step - start_step) > 0 and should_save:
                 torch.cuda.empty_cache()
                 self.save()
                 torch.cuda.empty_cache()
+
+            # Comparable fixed-prompt demo videos (every vis_iters), full-length + full
+            # denoising, so quality is directly comparable across steps and runs.
+            vis_iters = int(getattr(self.config, "vis_iters", 0) or 0)
+            if (not self.config.no_visualize) and vis_iters > 0 and self.step % vis_iters == 0:
+                self._visualize_demo()
 
             # Logging
             if self.is_main_process:
@@ -352,6 +501,10 @@ class Trainer:
                             "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
                         }
                     )
+                    if "mem_grad_norm" in generator_log_dict:
+                        wandb_loss_dict["mem_grad_norm"] = generator_log_dict["mem_grad_norm"].mean().item()
+                    if "bi_grad_norm" in generator_log_dict:
+                        wandb_loss_dict["bi_grad_norm"] = generator_log_dict["bi_grad_norm"].mean().item()
 
                 wandb_loss_dict.update(
                     {
@@ -377,3 +530,155 @@ class Trainer:
                     if not self.disable_wandb:
                         wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
                     self.previous_time = current_time
+
+            # The upstream trainer is intentionally open-ended. Reproduction runs
+            # need a deterministic terminal checkpoint so multiple ablations can be
+            # queued safely on one machine.
+            max_steps = int(getattr(self.config, "max_steps", 0) or 0)
+            if max_steps > 0 and self.step >= max_steps:
+                if self.is_main_process:
+                    print(f"Reached max_steps={max_steps}; training complete.")
+                dist.barrier()
+                break
+
+    def run_memory_diagnostic(self):
+        """Collect target motion-energy ratios without any optimizer/backward step.
+
+        Each valid distributed iteration contributes one independently sampled chunk per
+        rank.  A rollout of exactly 21 frames has no preceding history and is skipped.
+        The generator, critic, EMA and all optimizer states remain untouched.
+        """
+        target_chunks = int(getattr(self.config, "memory_diagnostic_chunks", 200))
+        per_rank = (target_chunks + self.world_size - 1) // self.world_size
+        os.makedirs(self.output_path, exist_ok=True)
+        records_path = os.path.join(
+            self.output_path, "memory_diagnostic_records.jsonl")
+
+        # Persist every distributed batch (8 records on the reproduction machine).
+        # If a worker is pre-empted, a restart resumes from the last complete group
+        # instead of repeating all AR-teacher forwards.
+        gathered_records = []
+        completed_per_rank = 0
+        if self.is_main_process and os.path.exists(records_path):
+            with open(records_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        gathered_records.append(json.loads(line))
+            complete_count = (
+                min(len(gathered_records), target_chunks) // self.world_size
+            ) * self.world_size
+            gathered_records = gathered_records[:complete_count]
+            completed_per_rank = complete_count // self.world_size
+
+        completed_tensor = torch.tensor(
+            [completed_per_rank], device=self.device, dtype=torch.long)
+        dist.broadcast(completed_tensor, src=0)
+        local_valid = int(completed_tensor.item())
+        self.model.eval()
+
+        if self.is_main_process:
+            print(
+                f"MEMORY_DIAGNOSTIC_START:target_chunks={target_chunks}:"
+                f"world_size={self.world_size}:per_rank={per_rank}", flush=True)
+
+        while local_valid < per_rank:
+            batch = next(self.dataloader)
+            text_prompts = batch["prompts"]
+            batch_size = len(text_prompts)
+            image_or_video_shape = list(self.config.image_or_video_shape)
+            image_or_video_shape[0] = batch_size
+
+            with torch.no_grad():
+                conditional_dict = self.model.text_encoder(text_prompts=text_prompts)
+                if not getattr(self, "unconditional_dict", None):
+                    unconditional_dict = self.model.text_encoder(
+                        text_prompts=[self.config.negative_prompt] * batch_size)
+                    self.unconditional_dict = {
+                        key: value.detach() for key, value in unconditional_dict.items()}
+                else:
+                    unconditional_dict = self.unconditional_dict
+
+            # This experiment never updates any parameter.  Cover the complete rollout
+            # with no_grad as well (not just score/teacher calls inside DMD), otherwise
+            # autograd retains a large student rollout graph that is never consumed.
+            with torch.no_grad():
+                loss, log_dict = self.model.generator_loss(
+                    image_or_video_shape=image_or_video_shape,
+                    conditional_dict=conditional_dict,
+                    unconditional_dict=unconditional_dict,
+                    clean_latent=None,
+                    initial_latent=None,
+                )
+
+            if "memory_diag_r_raw" not in log_dict:
+                del loss, log_dict
+                continue
+
+            local = torch.stack([
+                log_dict["memory_diag_timestep"],
+                log_dict["memory_diag_r_raw"],
+                log_dict["memory_diag_r_lr"],
+            ], dim=1).float()
+            gathered = [torch.zeros_like(local) for _ in range(self.world_size)]
+            dist.all_gather(gathered, local)
+            if self.is_main_process:
+                new_records = torch.cat(gathered, dim=0).cpu().tolist()
+                gathered_records.extend(new_records)
+                with open(records_path, "a", encoding="utf-8") as handle:
+                    for row in new_records:
+                        handle.write(json.dumps({
+                            "timestep": row[0],
+                            "r_raw": row[1],
+                            "r_lr": row[2],
+                        }) + "\n")
+                    handle.flush()
+
+            local_valid += batch_size
+            if self.is_main_process:
+                print(
+                    f"MEMORY_DIAGNOSTIC_PROGRESS:"
+                    f"{min(local_valid * self.world_size, target_chunks)}/{target_chunks}",
+                    flush=True)
+
+            del loss, log_dict, local, gathered
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        if self.is_main_process:
+            records = [
+                [row["timestep"], row["r_raw"], row["r_lr"]]
+                if isinstance(row, dict) else row
+                for row in gathered_records[:target_chunks]
+            ]
+            bins = [(0, 250), (250, 500), (500, 750), (750, 1001)]
+            summary = {
+                "target_chunks": target_chunks,
+                "records": [
+                    {"timestep": row[0], "r_raw": row[1], "r_lr": row[2]}
+                    for row in records
+                ],
+                "bins": {},
+            }
+            for lo, hi in bins:
+                selected = [row for row in records if lo <= row[0] < hi]
+                name = f"{lo}-{hi if hi <= 1000 else 1000}"
+                if not selected:
+                    summary["bins"][name] = {"count": 0}
+                    continue
+                values = torch.tensor(selected, dtype=torch.float64)
+                summary["bins"][name] = {
+                    "count": len(selected),
+                    "r_raw_mean": values[:, 1].mean().item(),
+                    "r_raw_median": values[:, 1].median().item(),
+                    "r_lr_mean": values[:, 2].mean().item(),
+                    "r_lr_median": values[:, 2].median().item(),
+                }
+
+            output = os.path.join(self.output_path, "memory_diagnostic_summary.json")
+            with open(output, "w", encoding="utf-8") as handle:
+                json.dump(summary, handle, indent=2)
+            print("MEMORY_DIAGNOSTIC_SUMMARY=" + json.dumps(summary["bins"]), flush=True)
+            print(f"MEMORY_DIAGNOSTIC_COMPLETE:{output}", flush=True)
+
+        dist.barrier()

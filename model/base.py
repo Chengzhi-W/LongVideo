@@ -42,14 +42,44 @@ class BaseModel(nn.Module):
         self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
         self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
         self.iscausal = getattr(args, "causal", True)
+        # Shared flow-matching shift for the score models. The generator gets it via
+        # model_kwargs; real/fake must use the SAME shift so their scheduler sigmas
+        # match the DMD sampling shift (self.timestep_shift) and the x0<->v
+        # conversions stay consistent. Defaults to the generator's shift, else 5.0.
+        self._score_timestep_shift = getattr(
+            args, "timestep_shift", getattr(args, "model_kwargs", {}).get("timestep_shift", 5.0)
+        )
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=self.iscausal)
         self.generator.model.requires_grad_(True)
 
-        self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
+        self.real_score = WanDiffusionWrapper(
+            model_name=self.real_model_name, is_causal=False,
+            timestep_shift=self._score_timestep_shift,
+        )
         self.real_score.model.requires_grad_(False)
 
-        self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
+        # The fake_score (critic) is a bidirectional model, matching the
+        # bidirectional real_score so that the DMD gradient `v_fake - v_real` is a
+        # valid same-distribution score difference. It uses the shared score shift,
+        # aligned with real / generator / the DMD sampling shift.
+        self.fake_score = WanDiffusionWrapper(
+            model_name=self.fake_model_name, is_causal=False,
+            timestep_shift=self._score_timestep_shift,
+        )
         self.fake_score.model.requires_grad_(True)
+
+        # Optional frozen causal AR teacher for memory-aware DMD. It provides only the
+        # memory-effect term dD_A = x0_AR(x_t|h) - x0_AR(x_t|empty) that augments the
+        # Wan real score; it never needs to match Wan's quality. Gated by
+        # `use_memory_dmd` (default False -> vanilla DMD).
+        self.use_memory_dmd = getattr(args, "use_memory_dmd", False)
+        if self.use_memory_dmd:
+            self.ar_teacher = WanDiffusionWrapper(
+                **getattr(args, "ar_teacher_kwargs", {}),
+                model_name=getattr(args, "ar_teacher_name", "Wan2.1-T2V-1.3B"),
+                is_causal=True,
+            )
+            self.ar_teacher.model.requires_grad_(False)
 
         self.text_encoder = WanTextEncoder()
         self.text_encoder.requires_grad_(False)
@@ -152,6 +182,12 @@ class SelfForcingModel(BaseModel):
         assert min_num_frames % self.num_frame_per_block == 0
         max_num_blocks = max_num_frames // self.num_frame_per_block
         min_num_blocks = min_num_frames // self.num_frame_per_block
+        # Uniformly sample the rollout length in [21, num_training_frames] frames
+        # (5-15s), in whole-block steps. Used for BOTH vanilla and memory-aware DMD:
+        # the DMD loss always scores the LAST 21-frame window, and the memory term
+        # (when enabled) uses everything before it as the AR teacher's history. When
+        # the sampled length is exactly 21 (5s, a single window) there is no prior
+        # history, so the memory term is simply skipped (see _compute_kl_grad).
         num_generated_blocks = torch.randint(min_num_blocks, max_num_blocks + 1, (1,), device=self.device)
         dist.broadcast(num_generated_blocks, src=0)
         num_generated_blocks = num_generated_blocks.item()
@@ -161,7 +197,7 @@ class SelfForcingModel(BaseModel):
             min_num_frames += 1
         # Sync num_generated_frames across all processes
         noise_shape[1] = num_generated_frames
-        
+
         clean_image_or_video = None
         if clean_latent:
             clean_image_or_video = clean_latent.to(self.dtype)
@@ -174,6 +210,15 @@ class SelfForcingModel(BaseModel):
             clean_image_or_video=clean_image_or_video,
             **conditional_dict,
         )
+
+        # Stash the contiguous rollout so memory-aware DMD can build the AR teacher's
+        # history, and so the trainer can visualize the generator's rollout. Skipped
+        # during critic's rollout (_skip_segmentation), whose rollout is not scored.
+        if not getattr(self, "_skip_segmentation", False):
+            self._last_rollout_full = pred_image_or_video.to(self.dtype)
+        else:
+            self._last_rollout_full = None
+
         # Slice last 21 frames
         if pred_image_or_video.shape[1] > 21:
             with torch.no_grad():
@@ -226,6 +271,7 @@ class SelfForcingModel(BaseModel):
         return self.inference_pipeline.inference_with_trajectory(
             noise=noise,clean_image_or_video=clean_image_or_video, **conditional_dict
         )
+    
     def _initialize_inference_pipeline(self):
         """
         Lazy initialize the inference pipeline during the first backward simulation run.
@@ -243,10 +289,7 @@ class SelfForcingModel(BaseModel):
             last_step_only=self.args.last_step_only,
             num_max_frames=self.num_training_frames,
             context_noise=self.args.context_noise
-        )
-        
-
-
+        )      
 
 class TeacherForcingModel(BaseModel):
     def __init__(self, args, device):

@@ -1,4 +1,4 @@
-from utils.lmdb import get_array_shape_from_lmdb, retrieve_row_from_lmdb
+from utils.lmdb_ import get_array_shape_from_lmdb, retrieve_row_from_lmdb
 from torch.utils.data import Dataset
 import numpy as np
 import torch
@@ -69,6 +69,44 @@ class ODERegressionLMDBDataset(Dataset):
         }
 
 
+
+
+
+class LatentLMDBDataset(Dataset):
+    def __init__(self, data_path: str, max_pair: int = int(1e8)):
+        self.env = lmdb.open(data_path, readonly=True,
+                             lock=False, readahead=False, meminit=False)
+
+        self.latents_shape = get_array_shape_from_lmdb(self.env, 'latents')
+        self.max_pair = max_pair
+
+    def __len__(self):
+        return min(self.latents_shape[0], self.max_pair)
+
+    def __getitem__(self, idx):
+        """
+        Outputs:
+            - prompts: List of Strings
+            - latents: Tensor of shape (num_denoising_steps, num_frames, num_channels, height, width). It is ordered from pure noise to clean image.
+        """
+        latents = retrieve_row_from_lmdb(
+            self.env,
+            "latents", np.float16, idx, shape=self.latents_shape[1:]
+        )
+
+        if len(latents.shape) == 4:
+            latents = latents[None, ...]
+
+        prompts = retrieve_row_from_lmdb(
+            self.env,
+            "prompts", str, idx
+        )
+        return {
+            "prompts": prompts,
+            "clean_latent": torch.tensor(latents, dtype=torch.float32)[-1]
+        }
+
+
 class ShardingLMDBDataset(Dataset):
     def __init__(self, data_path: str, max_pair: int = int(1e8)):
         self.envs = []
@@ -122,6 +160,7 @@ class ShardingLMDBDataset(Dataset):
             "prompts": prompts,
             "ode_latent": torch.tensor(latents, dtype=torch.float32)
         }
+
 
 
 class TextImagePairDataset(Dataset):
@@ -212,6 +251,7 @@ class TextImagePairDataset(Dataset):
             'origin_size': (item['origin_width'], item['origin_height']),
             'idx': idx
         }
+
 
 
 def cycle(dl):

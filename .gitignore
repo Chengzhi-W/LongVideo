@@ -1,9 +1,34 @@
 __pycache__
+*.py[cod]
 *.egg-info
+.DS_Store
+.idea/
+.vscode/
+.venv/
+venv/
 
 wan_models
 checkpoints
 output
+outputs*
 dataset
 prompts/vidprom_filtered_extended.txt
 logs
+logs*/
+wandb/
+
+# Downloaded/training artifacts must never be committed.  UltraVideo-Long's
+# license also prohibits redistribution of its raw YouTube-derived videos.
+*.mp4
+*.zip
+*.part
+*.pt
+*.pth
+*.safetensors
+*.lmdb
+*.mdb
+
+# Local secrets.
+.env
+*.key
+*credentials*.json

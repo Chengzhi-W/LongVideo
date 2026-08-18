@@ -27,7 +27,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
 
         # Step 2: Initialize scheduler
         self.num_train_timesteps = args.num_train_timestep
-        self.sampling_steps = 50
+        # Per-chunk diffusion sampling steps; overridable from config (default 50).
+        self.sampling_steps = getattr(args, "sampling_steps", 50)
         self.sample_solver = 'unipc'
         self.shift = args.timestep_shift
 
@@ -103,7 +104,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             self._initialize_kv_cache(
                 batch_size=batch_size,
                 dtype=noise.dtype,
-                device=noise.device
+                device=noise.device,
+                num_frames=num_output_frames
             )
             self._initialize_crossattn_cache(
                 batch_size=batch_size,
@@ -231,8 +233,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     latents,
                     return_dict=False)[0]
                 latents = temp_x0
-                print(f"kv_cache['local_end_index']: {self.kv_cache_pos[0]['local_end_index']}")
-                print(f"kv_cache['global_end_index']: {self.kv_cache_pos[0]['global_end_index']}")
+                # print(f"kv_cache['local_end_index']: {self.kv_cache_pos[0]['local_end_index']}")
+                # print(f"kv_cache['global_end_index']: {self.kv_cache_pos[0]['global_end_index']}")
 
             # Step 3.2: record the model's output
             output[:, cache_start_frame:cache_start_frame + current_num_frames] = latents
@@ -602,7 +604,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
 
     
 
-    def _initialize_kv_cache(self, batch_size, dtype, device):
+    def _initialize_kv_cache(self, batch_size, dtype, device, num_frames=None):
         """
         Initialize a Per-GPU KV cache for the Wan model.
         """
@@ -611,6 +613,11 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         if self.local_attn_size != -1:
             # Use the local attention size to compute the KV cache size
             kv_cache_size = self.local_attn_size * self.frame_seq_length
+        elif num_frames is not None:
+            # local_attn_size == -1 means "no eviction": size the cache to hold the
+            # whole rollout (num_frames) so full-history attention has room. Without
+            # this a long rollout (>21 frames) overflows the default 32760 cache.
+            kv_cache_size = num_frames * self.frame_seq_length
         else:
             # Use the default KV cache size
             kv_cache_size = 32760

@@ -199,6 +199,7 @@ class CausVid(BaseModel):
         Output:
             - pred_image: a tensor with shape [B, F, C, H, W].
         """
+        clean_latent = clean_latent.to(self.device)
         simulated_noisy_input = []
         for timestep in self.denoising_step_list:
             noise = torch.randn(
@@ -228,7 +229,7 @@ class CausVid(BaseModel):
             image_or_video_shape[1],
             self.num_frame_per_block,
             uniform_timestep=False
-        )
+        ).cpu()
 
         # select the corresponding timestep's noisy input from the stacked tensor [B, T, F, C, H, W]
         noisy_input = torch.gather(
@@ -278,7 +279,7 @@ class CausVid(BaseModel):
         pred_image, gradient_mask = self._run_generator(
             image_or_video_shape=image_or_video_shape,
             conditional_dict=conditional_dict,
-            clean_latent=clean_latent
+            clean_latent=clean_latent.to(self.device)
         )
 
         # Step 2: Compute the DMD loss
@@ -321,7 +322,7 @@ class CausVid(BaseModel):
             generated_image, _ = self._run_generator(
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
-                clean_latent=clean_latent
+                clean_latent=clean_latent.to(self.device)
             )
 
         # Step 2: Compute the fake prediction

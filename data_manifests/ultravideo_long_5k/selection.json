@@ -1,0 +1,8 @@
+{
+  "count": 5000,
+  "min_duration": 15.6,
+  "resolution": "960",
+  "seed": 42,
+  "selection_sha256": "266445a139fc005372433bfd6878b5ee808b19d744388886b9186a1560af69ff",
+  "source": "APRIL-AIGC/UltraVideo-Long"
+}

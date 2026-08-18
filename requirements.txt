@@ -34,3 +34,4 @@ flask
 flask-socketio
 torchao
 ninja
+remotezip==0.12.3

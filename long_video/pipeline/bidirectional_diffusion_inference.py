@@ -27,7 +27,7 @@ class BidirectionalDiffusionInferencePipeline(torch.nn.Module):
         self.num_train_timesteps = args.num_train_timestep
         self.sampling_steps = 50
         self.sample_solver = 'unipc'
-        self.shift = 8.0
+        self.shift = 5.0
 
         self.args = args
 

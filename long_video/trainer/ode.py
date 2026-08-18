@@ -57,7 +57,7 @@ class Trainer:
 
         # Step 2: Initialize the model and optimizer
 
-        assert config.distribution_loss == "ode", "Only ODE loss is supported for ODE training"
+        assert config.trainer == "ode", "Only ODE loss is supported for ODE training"
         self.model = ODERegression(config, device=self.device)
 
         self.model.generator = fsdp_wrap(
@@ -93,9 +93,6 @@ class Trainer:
             dataset, shuffle=True, drop_last=True)
         dataloader = torch.utils.data.DataLoader(
             dataset, batch_size=config.batch_size, sampler=sampler, num_workers=8)
-        total_batch_size = getattr(config, "total_batch_size", None)
-        if total_batch_size is not None:
-            assert total_batch_size == config.batch_size * self.world_size, "Gradient accumulation is not supported for ODE training"
         self.dataloader = cycle(dataloader)
 
         self.step = 0
@@ -104,8 +101,25 @@ class Trainer:
         # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
         if getattr(config, "generator_ckpt", False):
             print(f"Loading pretrained generator from {config.generator_ckpt}")
-            state_dict = torch.load(config.generator_ckpt, map_location="cpu")[
-                'generator']
+            state_dict = torch.load(config.generator_ckpt, map_location="cpu")
+            if "generator" in state_dict:
+                state_dict = state_dict["generator"]
+                fixed = {}
+                for k, v in state_dict.items():
+                    if k.startswith("model._fsdp_wrapped_module."):
+                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
+                    fixed[k] = v
+                state_dict = fixed
+            elif "model" in state_dict:
+                state_dict = state_dict["model"]
+            elif "generator_ema" in state_dict:
+                gen_sd = state_dict["generator_ema"]
+                fixed = {}
+                for k, v in gen_sd.items():
+                    if k.startswith("model._fsdp_wrapped_module."):
+                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
+                    fixed[k] = v
+                state_dict = fixed
             self.model.generator.load_state_dict(
                 state_dict, strict=True
             )
@@ -131,8 +145,8 @@ class Trainer:
             print("Model saved to", os.path.join(self.output_path,
                   f"checkpoint_model_{self.step:06d}", "model.pt"))
 
-    def train_one_step(self):
-        VISUALIZE = self.step % 100 == 0
+    def train_one_step(self, loss_scale=1.0):
+        
         self.model.eval()  # prevent any randomness (e.g. dropout)
 
         # Step 1: Get the next batch of text prompts
@@ -140,7 +154,6 @@ class Trainer:
         text_prompts = batch["prompts"]
         ode_latent = batch["ode_latent"].to(
             device=self.device, dtype=self.dtype)
-
         # Step 2: Extract the conditional infos
         with torch.no_grad():
             conditional_dict = self.model.text_encoder(
@@ -182,33 +195,12 @@ class Trainer:
                 len(loss_breakdown[key_t])
 
         self.generator_optimizer.zero_grad()
-        generator_loss.backward()
+        (generator_loss * loss_scale).backward()
         generator_grad_norm = self.model.generator.clip_grad_norm_(
             self.max_grad_norm)
         self.generator_optimizer.step()
 
-        # Step 4: Visualization
-        if VISUALIZE and not self.config.no_visualize and not self.config.disable_wandb and self.is_main_process:
-            # Visualize the input, output, and ground truth
-            input = log_dict["input"]
-            output = log_dict["output"]
-            ground_truth = ode_latent[:, -1]
-
-            input_video = self.model.vae.decode_to_pixel(input)
-            output_video = self.model.vae.decode_to_pixel(output)
-            ground_truth_video = self.model.vae.decode_to_pixel(ground_truth)
-            input_video = 255.0 * (input_video.cpu().numpy() * 0.5 + 0.5)
-            output_video = 255.0 * (output_video.cpu().numpy() * 0.5 + 0.5)
-            ground_truth_video = 255.0 * (ground_truth_video.cpu().numpy() * 0.5 + 0.5)
-
-            # Visualize the input, output, and ground truth
-            wandb.log({
-                "input": wandb.Video(input_video, caption="Input", fps=16, format="mp4"),
-                "output": wandb.Video(output_video, caption="Output", fps=16, format="mp4"),
-                "ground_truth": wandb.Video(ground_truth_video, caption="Ground Truth", fps=16, format="mp4"),
-            }, step=self.step)
-
-        # Step 5: Logging
+        # Step 4: Logging
         if self.is_main_process and not self.disable_wandb:
             wandb_loss_dict = {
                 "generator_loss": generator_loss.item(),
@@ -223,9 +215,10 @@ class Trainer:
             gc.collect()
 
     def train(self):
+
         while True:
             self.train_one_step()
-            if (not self.config.no_save) and self.step % self.config.log_iters == 0:
+            if (not self.config.no_save) and self.step % self.config.log_iters == 0 and self.step > 0:
                 self.save()
                 torch.cuda.empty_cache()
 

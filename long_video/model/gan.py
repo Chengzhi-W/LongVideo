@@ -1,13 +1,13 @@
 import copy
-from pipeline import RollingForcingTrainingPipeline
+from pipeline import SelfForcingTrainingPipeline
 import torch.nn.functional as F
 from typing import Tuple
 import torch
 
-from model.base import RollingForcingModel
+from model.base import SelfForcingModel
 
 
-class GAN(RollingForcingModel):
+class GAN(SelfForcingModel):
     def __init__(self, args, device):
         """
         Initialize the GAN module.
@@ -36,7 +36,7 @@ class GAN(RollingForcingModel):
             self.fake_score.enable_gradient_checkpointing()
 
         # this will be init later with fsdp-wrapped modules
-        self.inference_pipeline: RollingForcingTrainingPipeline = None
+        self.inference_pipeline: SelfForcingTrainingPipeline = None
 
         # Step 2: Initialize all dmd hyperparameters
         self.num_train_timestep = args.num_train_timestep

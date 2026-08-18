@@ -1,11 +1,11 @@
-from pipeline import RollingForcingTrainingPipeline
+from pipeline import SelfForcingTrainingPipeline
 from typing import Optional, Tuple
 import torch
 
-from model.base import RollingForcingModel
+from model.base import SelfForcingModel
 
 
-class SiD(RollingForcingModel):
+class SiD(SelfForcingModel):
     def __init__(self, args, device):
         """
         Initialize the DMD (Distribution Matching Distillation) module.
@@ -24,7 +24,7 @@ class SiD(RollingForcingModel):
             self.real_score.enable_gradient_checkpointing()
 
         # this will be init later with fsdp-wrapped modules
-        self.inference_pipeline: RollingForcingTrainingPipeline = None
+        self.inference_pipeline: SelfForcingTrainingPipeline = None
 
         # Step 2: Initialize all dmd hyperparameters
         self.num_train_timestep = args.num_train_timestep
