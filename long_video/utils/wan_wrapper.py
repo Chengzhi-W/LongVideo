@@ -22,12 +22,12 @@ class WanTextEncoder(torch.nn.Module):
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load("wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+            torch.load("/apdcephfs_gy31/share_301869871/taiji/xxuanhe/models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
                        map_location='cpu', weights_only=False)
         )
 
         self.tokenizer = HuggingfaceTokenizer(
-            name="wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+            name="/apdcephfs_gy31/share_301869871/taiji/xxuanhe/models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
 
     @property
     def device(self):
@@ -66,7 +66,7 @@ class WanVAEWrapper(torch.nn.Module):
 
         # init model
         self.model = _video_vae(
-            pretrained_path="wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+            pretrained_path="/apdcephfs_gy31/share_301869871/taiji/xxuanhe/models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
             z_dim=16,
         ).eval().requires_grad_(False)
 
@@ -125,9 +125,9 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         if is_causal:
             self.model = CausalWanModel.from_pretrained(
-                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                f"/apdcephfs_gy31/share_301869871/taiji/xxuanhe/models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
         else:
-            self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
+            self.model = WanModel.from_pretrained(f"/apdcephfs_gy31/share_301869871/taiji/xxuanhe/models/{model_name}/")
         self.model.eval()
 
         # For non-causal diffusion, all frames share the same timestep
@@ -221,12 +221,13 @@ class WanDiffusionWrapper(torch.nn.Module):
         timestep: torch.Tensor, kv_cache: Optional[List[dict]] = None,
         crossattn_cache: Optional[List[dict]] = None,
         current_start: Optional[int] = None,
-        classify_mode: Optional[bool] = False,
-        concat_time_embeddings: Optional[bool] = False,
-        clean_x: Optional[torch.Tensor] = None,
-        aug_t: Optional[torch.Tensor] = None,
-        cache_start: Optional[int] = None,
-        updating_cache: Optional[bool] = False
+        
+        classify_mode: Optional[bool] = False, # DF
+        concat_time_embeddings: Optional[bool] = False, #DF
+        clean_x: Optional[torch.Tensor] = None, # TF
+        aug_t: Optional[torch.Tensor] = None, # for TF clean GT, if it's also noisy and needs denoising by the model, aug_t is its timestep
+        
+        cache_start: Optional[int] = None
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -246,20 +247,20 @@ class WanDiffusionWrapper(torch.nn.Module):
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
-                cache_start=cache_start,
-                updating_cache=updating_cache
+                cache_start=cache_start
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
                 # teacher forcing
                 flow_pred = self.model(
-                    noisy_image_or_video.permute(0, 2, 1, 3, 4),
+                    noisy_image_or_video.permute(0, 2, 1, 3, 4), # => [B, C, F, H, W]
                     t=input_timestep, context=prompt_embeds,
                     seq_len=self.seq_len,
-                    clean_x=clean_x.permute(0, 2, 1, 3, 4),
+                    clean_x=clean_x.permute(0, 2, 1, 3, 4), # => [B, C, F, H, W]
                     aug_t=aug_t,
                 ).permute(0, 2, 1, 3, 4)
             else:
+                # diffusion forcing or bidirectional
                 if classify_mode:
                     flow_pred, logits = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),

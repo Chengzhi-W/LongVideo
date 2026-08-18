@@ -1,0 +1,72 @@
+generator_ckpt: checkpoints/chunkwise/causal_ode.pt
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+real_name: Wan2.1-T2V-1.3B
+text_encoder_fsdp_wrap_strategy: size
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+seed: 42
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+lr_critic: 4.0e-07
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+batch_size: 1
+ema_weight: 0.99
+ema_start_step: 200
+total_batch_size: 64
+
+log_iters: 20
+save_steps: [300,600,900,1200,1500,1800,2100,2400,2700,3000,3300,3600,3900,4200,4500,4800,5100,5400,5700,6000,6300,6600,6900,7200,7500,7800,8100,8400,8700,9000,9300,9600,9900,10200,10500,10800,11100,11400,11700,12000,12300,12600,12900,13200,13500,13800,14100,14400,14700,15000,15300,15600,15900,16200,16500,16800,17100,17400,17700,18000,18300,18600,18900,19200,19500,19800,20100,20400,20700,21000,21300,21600,21900,22200,22500,22800,23100,23400,23700,24000,24300,24600,24900,25200,25500,25800,26100,26400,26700,27000,27300,27600,27900,28200,28500,28800,29100,29400,29700,30000,30300,30600,30900,31200,31500,31800,32100,32400,32700,33000,33300,33600,33900,34200,34500,34800,35100,35400,35700,36000,36300,36600,36900,37200,37500,37800,38100,38400,38700,39000,39300,39600,39900,40200,40500,40800,41100,41400,41700,42000,42300,42600,42900,43200,43500,43800,44100,44400,44700,45000,45300,45600,45900,46200,46500,46800,47100,47400,47700,48000,48300,48600,48900,49200,49500,49800,50100,50400,50700,51000,51300,51600,51900,52200,52500,52800,53100,53400,53700,54000,54300,54600,54900,55200,55500,55800,56100,56400,56700,57000,57300,57600,57900,58200,58500,58800,59100,59400,59700,60000,60300,60600,60900,61200,61500,61800,62100,62400,62700,63000,63300,63600,63900,64200,64500,64800,65100,65400,65700,66000,66300,66600,66900,67200,67500,67800,68100,68400,68700,69000,69300,69600,69900,70200,70500,70800,71100,71400,71700,72000,72300,72600,72900,73200,73500,73800,74100,74400,74700,75000,75300,75600,75900,76200,76500,76800,77100,77400,77700,78000,78300,78600,78900,79200,79500,79800,80100,80400,80700,81000,81300,81600,81900,82200,82500,82800,83100,83400,83700,84000,84300,84600,84900,85200,85500,85800,86100,86400,86700,87000,87300,87600,87900,88200,88500,88800,89100,89400,89700,90000,90300,90600,90900,91200,91500,91800,92100,92400,92700,93000,93300,93600,93900,94200,94500,94800,95100,95400,95700,96000,96300,96600,96900,97200,97500,97800,98100,98400,98700,99000]
+max_steps: 0
+vis_iters: 50
+vis_prompt_path: prompts/demos.txt
+vis_num_prompts: 8
+vis_seed: 0
+wandb_host: https://api.wandb.ai
+wandb_entity: 12421147-zhejiang-university
+wandb_project: long-video
+
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+dfake_gen_update_ratio: 5
+image_or_video_shape: [1, 21, 16, 60, 104]
+distribution_loss: dmd
+trainer: score_distillation
+gradient_checkpointing: true
+num_frame_per_block: 3
+load_raw_video: false
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 21
+  sink_size: 3
+data_path: prompts/vidprom_filtered_extended.txt
+num_training_frames: 63
+
+# Long-vs-Local History DMD.  This is opt-in and leaves the senior mem1 config
+# unchanged.  Both AR branches predict the same noisy current chunk at RoPE 18..20:
+# full sees history 0..17, local sees only recent history 12..17.
+use_memory_dmd: true
+ar_teacher_name: Wan2.1-T2V-1.3B
+ar_teacher_ckpt: checkpoints/chunkwise/ar_diffusion.pt
+ar_teacher_fsdp_wrap_strategy: size
+ar_teacher_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 21
+  sink_size: 0
+memory_control_type: local_history
+memory_full_frames: 18
+memory_local_frames: 6
+memory_dmd_scale: 1.0
+memory_max_timestep: 750
+memory_sink_frames: 0
+memory_highpass: false
+memory_joint_normalization: true

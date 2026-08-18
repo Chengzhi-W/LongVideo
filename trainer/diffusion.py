@@ -44,7 +44,10 @@ class Trainer:
         set_seed(config.seed + global_rank)
 
         if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=config.wandb_host, key=config.wandb_key)
+            wandb.login(
+                host=config.wandb_host,
+                key=getattr(config, "wandb_key", None) or os.environ.get("WANDB_API_KEY")
+            )
             wandb.init(
                 config=OmegaConf.to_container(config, resolve=True),
                 name=config.config_name,
@@ -86,18 +89,34 @@ class Trainer:
 
         # Step 3: Initialize the dataloader
         dataset = LatentLMDBDataset(config.data_path, max_pair=int(1e8))
-       
+
         self.dataset = dataset
+        effective_global_batch = dist.get_world_size() * int(config.batch_size)
+        configured_global_batch = int(getattr(config, "total_batch_size", effective_global_batch))
+        if configured_global_batch != effective_global_batch:
+            raise RuntimeError(
+                "This AR trainer does not use gradient accumulation: "
+                f"total_batch_size={configured_global_batch}, but world_size * "
+                f"batch_size={effective_global_batch}. Make them equal."
+            )
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
         dataloader = torch.utils.data.DataLoader(
             dataset,
             batch_size=config.batch_size,
             sampler=sampler,
-            num_workers=8)
+            num_workers=int(getattr(config, "num_workers", 8)))
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
+            print("DATASET LATENT SHAPE", dataset.latents_shape)
+        expected_shape = tuple(int(v) for v in config.image_or_video_shape[1:])
+        actual_shape = tuple(int(v) for v in dataset.latents_shape[1:])
+        if actual_shape != expected_shape:
+            raise RuntimeError(
+                f"LMDB/config shape mismatch: dataset row {actual_shape} != "
+                f"image_or_video_shape {expected_shape}"
+            )
         self.dataloader = cycle(dataloader)
 
         ##############################################################################################################
@@ -154,7 +173,7 @@ class Trainer:
         self.max_grad_norm = 10.0
         self.previous_time = None
         self.delta_mean = None
-        self.rtf_ema_ratio = getattr(self.config, "rtf_ema_ratio", 0.9) 
+        self.rtf_ema_ratio = getattr(self.config, "rtf_ema_ratio", 0.9)
         self.eval_interval = getattr(self.config, "eval_interval", 0)      # 0 => disable
         self.eval_frames = getattr(self.config, "eval_num_output_frames", 21)
         self.eval_init = getattr(self.config, "eval_num_init_frames", 3)
@@ -164,13 +183,13 @@ class Trainer:
             self.pipeline = CausalDiffusionInferencePipeline(config, device=self.device)
             self.pipeline.generator = self.model.generator
             self.pipeline.text_encoder = self.model.text_encoder
-            
+
     def save(self):
         print("Start gathering distributed model states...")
         generator_state_dict = fsdp_state_dict(
             self.model.generator)
 
-        if self.config.ema_start_step < self.step:
+        if self.generator_ema is not None and self.config.ema_start_step < self.step:
             state_dict = {
                 "generator": generator_state_dict,
                 "generator_ema": self.generator_ema.full_state_dict(self.model.generator),
@@ -202,7 +221,7 @@ class Trainer:
         else:  # encode raw video to latent
             frames = batch["frames"].to(
                 device=self.device, dtype=self.dtype)
-           
+
             with torch.no_grad():
                 clean_latent = self.model.vae.encode_to_latent(
                     frames).to(device=self.device, dtype=self.dtype)
@@ -215,7 +234,7 @@ class Trainer:
         # Step 2: Extract the conditional infos
         with torch.no_grad():
             conditional_dict = self.model.text_encoder(
-                text_prompts=text_prompts) 
+                text_prompts=text_prompts)
             if not getattr(self, "unconditional_dict", None):
                 unconditional_dict = self.model.text_encoder(
                     text_prompts=[self.config.negative_prompt] * batch_size)
@@ -259,14 +278,27 @@ class Trainer:
 
 
     def train(self):
+        configured_save_steps = getattr(self.config, "save_steps", None)
+        save_steps = (
+            {int(step) for step in configured_save_steps}
+            if configured_save_steps else None
+        )
+        max_steps = int(getattr(self.config, "max_steps", 0) or 0)
+        last_saved_step = -1
 
-        while True:
+        while max_steps <= 0 or self.step < max_steps:
             batch = next(self.dataloader)
             self.train_one_step(batch)
-                
-            if (not self.config.no_save) and self.step % self.config.log_iters == 0:
+
+            should_save = (
+                self.step in save_steps
+                if save_steps is not None
+                else self.step % self.config.log_iters == 0
+            )
+            if (not self.config.no_save) and should_save:
                 torch.cuda.empty_cache()
                 self.save()
+                last_saved_step = self.step
                 torch.cuda.empty_cache()
 
             barrier()
@@ -278,3 +310,10 @@ class Trainer:
                     if not self.disable_wandb:
                         wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
                     self.previous_time = current_time
+
+        if not self.config.no_save and self.step != last_saved_step:
+            torch.cuda.empty_cache()
+            self.save()
+            torch.cuda.empty_cache()
+        if self.is_main_process:
+            print(f"Reached max_steps={max_steps}; AR teacher fine-tuning complete.")

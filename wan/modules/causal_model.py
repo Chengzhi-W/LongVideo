@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch
 import math
 import torch.distributed as dist
+import os
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -23,7 +24,7 @@ import torch.distributed as dist
 flex_attention = torch.compile(
     flex_attention,
     dynamic=False,
-    mode="default"
+    mode=os.environ.get("WAN_FLEX_COMPILE_MODE", "default")
 )
 
 
@@ -500,6 +501,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.gradient_checkpointing = False
 
         self.block_mask = None
+        self.block_mask_signature = None
 
         self.num_frame_per_block = 1
         self.independent_first_frame = False
@@ -809,23 +811,51 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             block_mask=self.block_mask
         )
 
-        def create_custom_forward(module):
-            def custom_forward(*inputs, **kwargs):
-                return module(*inputs, **kwargs)
+        def create_custom_forward(module, kv_cache_snapshot=None):
+            """Keep checkpoint recomputation independent of the rolling KV cache.
+
+            The first invocation must update the live cache for the autoregressive
+            rollout.  PyTorch invokes this closure again during backward, after the
+            live cache has already advanced; recomputation therefore needs the cache
+            state from immediately before the original forward.  Store that state on
+            CPU so the snapshots do not consume the GPU memory saved by checkpointing.
+            """
+            first_invocation = True
+
+            def custom_forward(*inputs, **call_kwargs):
+                nonlocal first_invocation
+                if first_invocation or kv_cache_snapshot is None:
+                    first_invocation = False
+                    return module(*inputs, **call_kwargs)
+
+                device = inputs[0].device
+                recompute_cache = {
+                    name: value.to(device=device, non_blocking=False)
+                    for name, value in kv_cache_snapshot.items()
+                }
+                recompute_kwargs = dict(call_kwargs)
+                recompute_kwargs["kv_cache"] = recompute_cache
+                return module(*inputs, **recompute_kwargs)
+
             return custom_forward
 
         for block_index, block in enumerate(self.blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
-                kwargs.update(
+                block_kwargs = dict(kwargs)
+                block_kwargs.update(
                     {
                         "kv_cache": kv_cache[block_index],
                         "current_start": current_start,
                         "cache_start": cache_start
                     }
                 )
+                kv_cache_snapshot = {
+                    name: value.detach().to(device="cpu", copy=True)
+                    for name, value in kv_cache[block_index].items()
+                }
                 x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, **kwargs,
+                    create_custom_forward(block, kv_cache_snapshot),
+                    x, **block_kwargs,
                     use_reentrant=False,
                 )
             else:
@@ -884,8 +914,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        # Construct blockwise causal attn mask
-        if self.block_mask is None:
+        # Construct blockwise causal attention mask.  A model can be validated at
+        # a smaller smoke-test resolution before production training, so cache by
+        # shape instead of assuming the first ever input shape is permanent.
+        mask_signature = (
+            clean_x is not None,
+            int(x.shape[2]),
+            int(x.shape[-2]),
+            int(x.shape[-1]),
+            int(self.num_frame_per_block),
+            int(self.local_attn_size),
+        )
+        if self.block_mask is None or self.block_mask_signature != mask_signature:
             if clean_x is not None: # TF
                 if self.independent_first_frame:
                     raise NotImplementedError()
@@ -910,6 +950,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         num_frame_per_block=self.num_frame_per_block,
                         local_attn_size=self.local_attn_size
                     )
+            self.block_mask_signature = mask_signature
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]

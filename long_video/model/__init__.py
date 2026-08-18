@@ -4,11 +4,16 @@ from .dmd import DMD
 from .gan import GAN
 from .sid import SiD
 from .ode_regression import ODERegression
+from .naive_consistency import NaiveConsistency
+from .opd import OPD
+
 __all__ = [
     "CausalDiffusion",
     "CausVid",
     "DMD",
     "GAN",
     "SiD",
-    "ODERegression"
+    "ODERegression",
+    "NaiveConsistency",
+    "OPD"
 ]

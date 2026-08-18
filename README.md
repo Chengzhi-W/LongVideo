@@ -26,6 +26,23 @@
 
 
 -----
+## Long-video AR teacher handoff
+
+This private fork includes the tested UltraVideo-Long data and AR-teacher
+fine-tuning pipeline used by our long-video experiments. Start with
+[`docs/ULTRAVIDEO_LONG_5K.md`](docs/ULTRAVIDEO_LONG_5K.md).
+
+- Deterministic 5K manifest and resumable/range-based download.
+- Reproducible 249-frame preprocessing into 63 Wan latent frames and LMDB.
+- A one-GPU, two-step end-to-end smoke test that preserves all 63 latent frames.
+- An open-ended two-node launcher (8 GPUs per node) with W&B logging and
+  checkpoints every 100 steps; the operator chooses when to stop.
+
+Raw videos, latent shards, LMDBs, model checkpoints, logs and credentials are
+intentionally excluded from Git. The pipeline was validated on four real
+UltraVideo-Long clips and on an RTX PRO 6000 Blackwell GPU before handoff.
+
+-----
 The Causal Forcing series uses **Causal ODE** or **Causal Consistency Distillation** to drive asymmetric DMD as a theoretically correct initialization for real-time interactive video generation. **Refer to [this extension for long video generation](#minute-level-long-video-generation).**
 
 [Causal Forcing](https://arxiv.org/abs/2602.02214) significantly outperforms Self Forcing in **both visual quality and motion dynamics**, while keeping **the same training budget and inference efficiency**. We support both chunk-wise and **frame-wise** models, with the latter natively unifying T2V and **I2V**.

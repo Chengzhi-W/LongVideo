@@ -43,7 +43,15 @@ class SelfForcingTrainingPipeline:
         self.independent_first_frame = independent_first_frame
         self.same_step_across_blocks = same_step_across_blocks
         self.last_step_only = last_step_only
-        self.kv_cache_size = num_max_frames * self.frame_seq_length
+        # KV cache size. When the generator uses a finite local attention window
+        # (local_attn_size != -1), size the cache to that window so the model's
+        # eviction + sink logic actually triggers during rollout (train==infer
+        # geometry). Otherwise keep the whole-rollout cache (no eviction).
+        local_attn_size = getattr(generator.model, "local_attn_size", -1)
+        if local_attn_size != -1:
+            self.kv_cache_size = local_attn_size * self.frame_seq_length
+        else:
+            self.kv_cache_size = num_max_frames * self.frame_seq_length
 
     def generate_and_sync_list(self, num_blocks, num_denoising_steps, device):
         rank = dist.get_rank() if dist.is_initialized() else 0

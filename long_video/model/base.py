@@ -4,7 +4,7 @@ from torch import nn
 import torch.distributed as dist
 import torch
 
-from pipeline import RollingForcingTrainingPipeline
+from pipeline import SelfForcingTrainingPipeline,TeacherForcingTrainingPipeline,BidirectionalTrainingPipeline
 from utils.loss import get_denoising_loss
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
@@ -18,23 +18,68 @@ class BaseModel(nn.Module):
         self.args = args
         self.dtype = torch.bfloat16 if args.mixed_precision else torch.float32
         if hasattr(args, "denoising_step_list"):
-            self.denoising_step_list = torch.tensor(args.denoising_step_list, dtype=torch.long)
+            self.denoising_step_list = torch.tensor(args.denoising_step_list, dtype=torch.long, device=self.device)
             if args.warp_denoising_step:
-                timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
+                timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))).to(self.device)
                 self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
+        # Optional: separate denoising schedule for the first chunk (block 0).
+        # If the config does not provide `denoising_step_list_first_chunk`, all
+        # blocks share `denoising_step_list` (backwards compatible).
+        # This technique is proposed by [ASD](https://github.com/BigAandSmallq/SAD) for 1/2-step DMD. 
+        # We thank ASD for its contribution.
+        if hasattr(args, "denoising_step_list_first_chunk") and args.denoising_step_list_first_chunk is not None:
+            self.denoising_step_list_first_chunk = torch.tensor(
+                args.denoising_step_list_first_chunk, dtype=torch.long, device=self.device)
+            if args.warp_denoising_step:
+                timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))).to(self.device)
+                self.denoising_step_list_first_chunk = timesteps[1000 - self.denoising_step_list_first_chunk]
+        else:
+            self.denoising_step_list_first_chunk = None
+
     def _initialize_models(self, args, device):
+        
         self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
         self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
-
-        self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
+        self.iscausal = getattr(args, "causal", True)
+        # Shared flow-matching shift for the score models. The generator gets it via
+        # model_kwargs; real/fake must use the SAME shift so their scheduler sigmas
+        # match the DMD sampling shift (self.timestep_shift) and the x0<->v
+        # conversions stay consistent. Defaults to the generator's shift, else 5.0.
+        self._score_timestep_shift = getattr(
+            args, "timestep_shift", getattr(args, "model_kwargs", {}).get("timestep_shift", 5.0)
+        )
+        self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=self.iscausal)
         self.generator.model.requires_grad_(True)
 
-        self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
+        self.real_score = WanDiffusionWrapper(
+            model_name=self.real_model_name, is_causal=False,
+            timestep_shift=self._score_timestep_shift,
+        )
         self.real_score.model.requires_grad_(False)
 
-        self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
+        # The fake_score (critic) is a bidirectional model, matching the
+        # bidirectional real_score so that the DMD gradient `v_fake - v_real` is a
+        # valid same-distribution score difference. It uses the shared score shift,
+        # aligned with real / generator / the DMD sampling shift.
+        self.fake_score = WanDiffusionWrapper(
+            model_name=self.fake_model_name, is_causal=False,
+            timestep_shift=self._score_timestep_shift,
+        )
         self.fake_score.model.requires_grad_(True)
+
+        # Optional frozen causal AR teacher for memory-aware DMD. It provides only the
+        # memory-effect term dD_A = x0_AR(x_t|h) - x0_AR(x_t|empty) that augments the
+        # Wan real score; it never needs to match Wan's quality. Gated by
+        # `use_memory_dmd` (default False -> vanilla DMD).
+        self.use_memory_dmd = getattr(args, "use_memory_dmd", False)
+        if self.use_memory_dmd:
+            self.ar_teacher = WanDiffusionWrapper(
+                **getattr(args, "ar_teacher_kwargs", {}),
+                model_name=getattr(args, "ar_teacher_name", "Wan2.1-T2V-1.3B"),
+                is_causal=True,
+            )
+            self.ar_teacher.model.requires_grad_(False)
 
         self.text_encoder = WanTextEncoder()
         self.text_encoder.requires_grad_(False)
@@ -95,7 +140,7 @@ class BaseModel(nn.Module):
             return timestep
 
 
-class RollingForcingModel(BaseModel):
+class SelfForcingModel(BaseModel):
     def __init__(self, args, device):
         super().__init__(args, device)
         self.denoising_loss_func = get_denoising_loss(args.denoising_loss_type)()
@@ -104,6 +149,7 @@ class RollingForcingModel(BaseModel):
         self,
         image_or_video_shape,
         conditional_dict: dict,
+        clean_latent = None,
         initial_latent: torch.tensor = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -136,6 +182,12 @@ class RollingForcingModel(BaseModel):
         assert min_num_frames % self.num_frame_per_block == 0
         max_num_blocks = max_num_frames // self.num_frame_per_block
         min_num_blocks = min_num_frames // self.num_frame_per_block
+        # Uniformly sample the rollout length in [21, num_training_frames] frames
+        # (5-15s), in whole-block steps. Used for BOTH vanilla and memory-aware DMD:
+        # the DMD loss always scores the LAST 21-frame window, and the memory term
+        # (when enabled) uses everything before it as the AR teacher's history. When
+        # the sampled length is exactly 21 (5s, a single window) there is no prior
+        # history, so the memory term is simply skipped (see _compute_kl_grad).
         num_generated_blocks = torch.randint(min_num_blocks, max_num_blocks + 1, (1,), device=self.device)
         dist.broadcast(num_generated_blocks, src=0)
         num_generated_blocks = num_generated_blocks.item()
@@ -146,11 +198,27 @@ class RollingForcingModel(BaseModel):
         # Sync num_generated_frames across all processes
         noise_shape[1] = num_generated_frames
 
+        clean_image_or_video = None
+        if clean_latent:
+            clean_image_or_video = clean_latent.to(self.dtype)
+            clean_image_or_video = clean_image_or_video.to(self.device)
+            assert clean_image_or_video.shape == tuple(noise_shape), f"{clean_image_or_video.shape} != {tuple(noise_shape)}"
+
         pred_image_or_video, denoised_timestep_from, denoised_timestep_to = self._consistency_backward_simulation(
             noise=torch.randn(noise_shape,
                               device=self.device, dtype=self.dtype),
+            clean_image_or_video=clean_image_or_video,
             **conditional_dict,
         )
+
+        # Stash the contiguous rollout so memory-aware DMD can build the AR teacher's
+        # history, and so the trainer can visualize the generator's rollout. Skipped
+        # during critic's rollout (_skip_segmentation), whose rollout is not scored.
+        if not getattr(self, "_skip_segmentation", False):
+            self._last_rollout_full = pred_image_or_video.to(self.dtype)
+        else:
+            self._last_rollout_full = None
+
         # Slice last 21 frames
         if pred_image_or_video.shape[1] > 21:
             with torch.no_grad():
@@ -182,6 +250,7 @@ class RollingForcingModel(BaseModel):
     def _consistency_backward_simulation(
         self,
         noise: torch.Tensor,
+        clean_image_or_video: torch.Tensor,
         **conditional_dict: dict
     ) -> torch.Tensor:
         """
@@ -199,26 +268,19 @@ class RollingForcingModel(BaseModel):
         if self.inference_pipeline is None:
             self._initialize_inference_pipeline()
 
-        infer_w_rolling = torch.rand(1, device=self.device) > 0.5
-        dist.broadcast(infer_w_rolling, src=0)
-
-        if infer_w_rolling:
-            return self.inference_pipeline.inference_with_rolling_forcing(
-                noise=noise, **conditional_dict
-            )
-        else:
-            return self.inference_pipeline.inference_with_self_forcing(
-                noise=noise, **conditional_dict
-            )
-
+        return self.inference_pipeline.inference_with_trajectory(
+            noise=noise,clean_image_or_video=clean_image_or_video, **conditional_dict
+        )
+    
     def _initialize_inference_pipeline(self):
         """
         Lazy initialize the inference pipeline during the first backward simulation run.
         Here we encapsulate the inference code with a model-dependent outside function.
         We pass our FSDP-wrapped modules into the pipeline to save memory.
         """
-        self.inference_pipeline = RollingForcingTrainingPipeline(
+        self.inference_pipeline = SelfForcingTrainingPipeline(
             denoising_step_list=self.denoising_step_list,
+            denoising_step_list_first_chunk=self.denoising_step_list_first_chunk,
             scheduler=self.scheduler,
             generator=self.generator,
             num_frame_per_block=self.num_frame_per_block,
@@ -227,4 +289,274 @@ class RollingForcingModel(BaseModel):
             last_step_only=self.args.last_step_only,
             num_max_frames=self.num_training_frames,
             context_noise=self.args.context_noise
+        )      
+
+class TeacherForcingModel(BaseModel):
+    def __init__(self, args, device):
+        super().__init__(args, device)
+        self.denoising_loss_func = get_denoising_loss(args.denoising_loss_type)()
+
+    def _run_generator(
+        self,
+        image_or_video_shape,
+        conditional_dict: dict,
+        clean_latent,
+        initial_latent: torch.tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Optionally simulate the generator's input from noise using backward simulation
+        and then run the generator for one-step.
+        Input:
+            - image_or_video_shape: a list containing the shape of the image or video [B, F, C, H, W].
+            - conditional_dict: a dictionary containing the conditional information (e.g. text embeddings, image embeddings).
+            - unconditional_dict: a dictionary containing the unconditional information (e.g. null/negative text embeddings, null/negative image embeddings).
+            - clean_latent: a tensor containing the clean latents [B, F, C, H, W]. Need to be passed when no backward simulation is used.
+            - initial_latent: a tensor containing the initial latents [B, F, C, H, W].
+        Output:
+            - pred_image: a tensor with shape [B, F, C, H, W].
+            - denoised_timestep: an integer
+        """
+        # Step 1: Sample noise and backward simulate the generator's input
+        assert getattr(self.args, "backward_simulation", True), "Backward simulation needs to be enabled"
+        if initial_latent is not None: # never met
+            conditional_dict["initial_latent"] = initial_latent
+        if self.args.i2v: # never met
+            noise_shape = [image_or_video_shape[0], image_or_video_shape[1] - 1, *image_or_video_shape[2:]]
+        else:
+            noise_shape = image_or_video_shape.copy()
+
+        # During training, the number of generated frames should be uniformly sampled from
+        # [21, self.num_training_frames], but still being a multiple of self.num_frame_per_block
+        min_num_frames = 20 if self.args.independent_first_frame else 21
+        max_num_frames = self.num_training_frames - 1 if self.args.independent_first_frame else self.num_training_frames
+        assert max_num_frames % self.num_frame_per_block == 0
+        assert min_num_frames % self.num_frame_per_block == 0
+        max_num_blocks = max_num_frames // self.num_frame_per_block
+        min_num_blocks = min_num_frames // self.num_frame_per_block
+        num_generated_blocks = torch.randint(min_num_blocks, max_num_blocks + 1, (1,), device=self.device)
+        dist.broadcast(num_generated_blocks, src=0)
+        num_generated_blocks = num_generated_blocks.item()
+        num_generated_frames = num_generated_blocks * self.num_frame_per_block
+        if self.args.independent_first_frame and initial_latent is None: # never met
+            num_generated_frames += 1
+            min_num_frames += 1
+        # Sync num_generated_frames across all processes
+        noise_shape[1] = num_generated_frames
+
+        # ========== TF clean video. todo: add noise for RTF. ==========
+        clean_image_or_video = clean_latent.to(self.dtype)
+        clean_image_or_video = clean_image_or_video.to(self.device)
+        assert clean_image_or_video.shape == tuple(noise_shape), f"{clean_image_or_video.shape} != {tuple(noise_shape)}"
+
+        # ==============================================================
+        
+        pred_image_or_video, denoised_timestep_from, denoised_timestep_to = self._consistency_backward_simulation_tf(
+            noise=torch.randn(noise_shape,
+                              device=self.device, dtype=self.dtype),
+            clean_image_or_video=clean_image_or_video,
+            **conditional_dict,
+        )
+        # Slice last 21 frames
+        if pred_image_or_video.shape[1] > 21:
+            with torch.no_grad():
+                # Reencode to get image latent
+                latent_to_decode = pred_image_or_video[:, :-20, ...]
+                # Deccode to video
+                pixels = self.vae.decode_to_pixel(latent_to_decode)
+                frame = pixels[:, -1:, ...].to(self.dtype)
+                frame = rearrange(frame, "b t c h w -> b c t h w")
+                # Encode frame to get image latent
+                image_latent = self.vae.encode_to_latent(frame).to(self.dtype)
+            pred_image_or_video_last_21 = torch.cat([image_latent, pred_image_or_video[:, -20:, ...]], dim=1)
+        else:
+            pred_image_or_video_last_21 = pred_image_or_video
+
+        if num_generated_frames != min_num_frames:
+            # Currently, we do not use gradient for the first chunk, since it contains image latents
+            gradient_mask = torch.ones_like(pred_image_or_video_last_21, dtype=torch.bool)
+            if self.args.independent_first_frame:
+                gradient_mask[:, :1] = False
+            else:
+                gradient_mask[:, :self.num_frame_per_block] = False
+        else:
+            gradient_mask = None
+
+        pred_image_or_video_last_21 = pred_image_or_video_last_21.to(self.dtype)
+        return pred_image_or_video_last_21, gradient_mask, denoised_timestep_from, denoised_timestep_to
+        
+    def _consistency_backward_simulation_tf(
+        self,
+        noise: torch.Tensor,
+        clean_image_or_video: torch.Tensor,
+        **conditional_dict: dict
+    ) -> torch.Tensor:
+        """
+        Simulate the generator's input from noise to avoid training/inference mismatch.
+        See Sec 4.5 of the DMD2 paper (https://arxiv.org/abs/2405.14867) for details.
+        Here we use the consistency sampler (https://arxiv.org/abs/2303.01469)
+        Input:
+            - noise: a tensor sampled from N(0, 1) with shape [B, F, C, H, W] where the number of frame is 1 for images.
+            - clean_image_or_video: clean GT video latent with shape [B, F, C, H, W] where the number of frame is 1 for images.
+            - conditional_dict: a dictionary containing the conditional information (e.g. text embeddings, image embeddings).
+        Output:
+            - output: a tensor with shape [B, T, F, C, H, W].
+            T is the total number of timesteps. output[0] is a pure noise and output[i] and i>0
+            represents the x0 prediction at each timestep.
+        """
+        if self.inference_pipeline is None:
+            self._initialize_inference_pipeline_tf()
+
+        return self.inference_pipeline.inference_with_trajectory(
+            noise=noise,
+            clean_image_or_video=clean_image_or_video,
+            **conditional_dict
+        )
+        
+    def _initialize_inference_pipeline_tf(self):
+        """
+        Lazy initialize the inference pipeline during the first backward simulation run.
+        Here we encapsulate the inference code with a model-dependent outside function.
+        We pass our FSDP-wrapped modules into the pipeline to save memory.
+        """
+        self.inference_pipeline = TeacherForcingTrainingPipeline(
+            denoising_step_list=self.denoising_step_list,
+            scheduler=self.scheduler,
+            generator=self.generator,
+            num_frame_per_block=self.num_frame_per_block,
+            independent_first_frame=self.args.independent_first_frame,
+            same_step_across_blocks=self.args.same_step_across_blocks,
+            last_step_only=self.args.last_step_only,
+            num_max_frames=self.num_training_frames,
+            context_noise=self.args.context_noise,
+            spatial_self=True
+        )
+
+class BidirectionalModel(BaseModel):
+    def __init__(self, args, device):
+        super().__init__(args, device)
+        self.denoising_loss_func = get_denoising_loss(args.denoising_loss_type)()
+
+    def _run_generator(
+        self,
+        image_or_video_shape,
+        conditional_dict: dict,
+        clean_latent = None,
+        initial_latent: torch.tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Optionally simulate the generator's input from noise using backward simulation
+        and then run the generator for one-step.
+        Input:
+            - image_or_video_shape: a list containing the shape of the image or video [B, F, C, H, W].
+            - conditional_dict: a dictionary containing the conditional information (e.g. text embeddings, image embeddings).
+            - unconditional_dict: a dictionary containing the unconditional information (e.g. null/negative text embeddings, null/negative image embeddings).
+            - clean_latent: a tensor containing the clean latents [B, F, C, H, W]. Need to be passed when no backward simulation is used.
+            - initial_latent: a tensor containing the initial latents [B, F, C, H, W].
+        Output:
+            - pred_image: a tensor with shape [B, F, C, H, W].
+            - denoised_timestep: an integer
+        """
+        # Step 1: Sample noise and backward simulate the generator's input
+        assert getattr(self.args, "backward_simulation", True), "Backward simulation needs to be enabled"
+        if initial_latent is not None: # never met
+            conditional_dict["initial_latent"] = initial_latent
+        if self.args.i2v: # never met
+            noise_shape = [image_or_video_shape[0], image_or_video_shape[1] - 1, *image_or_video_shape[2:]]
+        else:
+            noise_shape = image_or_video_shape.copy()
+
+        # During training, the number of generated frames should be uniformly sampled from
+        # [21, self.num_training_frames], but still being a multiple of self.num_frame_per_block
+        min_num_frames = 20 if self.args.independent_first_frame else 21
+        max_num_frames = self.num_training_frames - 1 if self.args.independent_first_frame else self.num_training_frames
+        assert max_num_frames % self.num_frame_per_block == 0
+        assert min_num_frames % self.num_frame_per_block == 0
+        max_num_blocks = max_num_frames // self.num_frame_per_block
+        min_num_blocks = min_num_frames // self.num_frame_per_block
+        num_generated_blocks = torch.randint(min_num_blocks, max_num_blocks + 1, (1,), device=self.device)
+        dist.broadcast(num_generated_blocks, src=0)
+        num_generated_blocks = num_generated_blocks.item()
+        num_generated_frames = num_generated_blocks * self.num_frame_per_block
+        if self.args.independent_first_frame and initial_latent is None: # never met
+            num_generated_frames += 1
+            min_num_frames += 1
+        # Sync num_generated_frames across all processes
+        noise_shape[1] = num_generated_frames
+        
+        pred_image_or_video, denoised_timestep_from, denoised_timestep_to = self._consistency_backward_simulation_bidirectional(
+            noise=torch.randn(noise_shape,
+                              device=self.device, dtype=self.dtype),
+            **conditional_dict,
+        )
+        # Slice last 21 frames
+        if pred_image_or_video.shape[1] > 21:
+            with torch.no_grad():
+                # Reencode to get image latent
+                latent_to_decode = pred_image_or_video[:, :-20, ...]
+                # Deccode to video
+                pixels = self.vae.decode_to_pixel(latent_to_decode)
+                frame = pixels[:, -1:, ...].to(self.dtype)
+                frame = rearrange(frame, "b t c h w -> b c t h w")
+                # Encode frame to get image latent
+                image_latent = self.vae.encode_to_latent(frame).to(self.dtype)
+            pred_image_or_video_last_21 = torch.cat([image_latent, pred_image_or_video[:, -20:, ...]], dim=1)
+        else:
+            pred_image_or_video_last_21 = pred_image_or_video
+
+        if num_generated_frames != min_num_frames:
+            # Currently, we do not use gradient for the first chunk, since it contains image latents
+            gradient_mask = torch.ones_like(pred_image_or_video_last_21, dtype=torch.bool)
+            if self.args.independent_first_frame:
+                gradient_mask[:, :1] = False
+            else:
+                gradient_mask[:, :self.num_frame_per_block] = False
+        else:
+            gradient_mask = None
+
+        pred_image_or_video_last_21 = pred_image_or_video_last_21.to(self.dtype)
+        return pred_image_or_video_last_21, gradient_mask, denoised_timestep_from, denoised_timestep_to
+        
+    def _consistency_backward_simulation_bidirectional(
+        self,
+        noise: torch.Tensor,
+        **conditional_dict: dict
+    ) -> torch.Tensor:
+        """
+        Simulate the generator's input from noise to avoid training/inference mismatch.
+        See Sec 4.5 of the DMD2 paper (https://arxiv.org/abs/2405.14867) for details.
+        Here we use the consistency sampler (https://arxiv.org/abs/2303.01469)
+        Input:
+            - noise: a tensor sampled from N(0, 1) with shape [B, F, C, H, W] where the number of frame is 1 for images.
+            - clean_image_or_video: clean GT video latent with shape [B, F, C, H, W] where the number of frame is 1 for images.
+            - conditional_dict: a dictionary containing the conditional information (e.g. text embeddings, image embeddings).
+        Output:
+            - output: a tensor with shape [B, T, F, C, H, W].
+            T is the total number of timesteps. output[0] is a pure noise and output[i] and i>0
+            represents the x0 prediction at each timestep.
+        """
+        if self.inference_pipeline is None:
+            self._initialize_inference_pipeline_bidirectional()
+
+        return self.inference_pipeline.inference_with_trajectory(
+            noise=noise,
+            **conditional_dict
+        )
+        
+    def _initialize_inference_pipeline_bidirectional(self):
+        """
+        Lazy initialize the inference pipeline during the first backward simulation run.
+        Here we encapsulate the inference code with a model-dependent outside function.
+        We pass our FSDP-wrapped modules into the pipeline to save memory.
+        """
+        self.inference_pipeline = BidirectionalTrainingPipeline(
+            denoising_step_list=self.denoising_step_list,
+            scheduler=self.scheduler,
+            generator=self.generator,
+            num_frame_per_block=self.num_frame_per_block,
+            independent_first_frame=self.args.independent_first_frame,
+            same_step_across_blocks=self.args.same_step_across_blocks,
+            last_step_only=self.args.last_step_only,
+            num_max_frames=self.num_training_frames,
+            context_noise=self.args.context_noise,
+            spatial_self=True
         )

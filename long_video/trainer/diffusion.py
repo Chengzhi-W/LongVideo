@@ -2,7 +2,7 @@ import gc
 import logging
 
 from model import CausalDiffusion
-from utils.dataset import ShardingLMDBDataset, cycle
+from utils.dataset import cycle, LatentLMDBDataset
 from utils.misc import set_seed
 import torch.distributed as dist
 from omegaconf import OmegaConf
@@ -10,9 +10,12 @@ import torch
 import wandb
 import time
 import os
-
+import math
 from utils.distributed import EMA_FSDP, barrier, fsdp_wrap, fsdp_state_dict, launch_distributed_job
-
+from pipeline import (
+    CausalDiffusionInferencePipeline,
+    CausalInferencePipeline,
+)
 
 class Trainer:
     def __init__(self, config):
@@ -82,7 +85,9 @@ class Trainer:
         )
 
         # Step 3: Initialize the dataloader
-        dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
+        dataset = LatentLMDBDataset(config.data_path, max_pair=int(1e8))
+       
+        self.dataset = dataset
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
         dataloader = torch.utils.data.DataLoader(
@@ -122,11 +127,23 @@ class Trainer:
             state_dict = torch.load(config.generator_ckpt, map_location="cpu")
             if "generator" in state_dict:
                 state_dict = state_dict["generator"]
+                fixed = {}
+                for k, v in state_dict.items():
+                    if k.startswith("model._fsdp_wrapped_module."):
+                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
+                    fixed[k] = v
+                state_dict = fixed
             elif "model" in state_dict:
                 state_dict = state_dict["model"]
-            self.model.generator.load_state_dict(
-                state_dict, strict=True
-            )
+            elif "generator_ema" in state_dict:
+                gen_sd = state_dict["generator_ema"]
+                fixed = {}
+                for k, v in gen_sd.items():
+                    if k.startswith("model._fsdp_wrapped_module."):
+                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
+                    fixed[k] = v
+                state_dict = fixed
+            self.model.generator.load_state_dict(state_dict, strict=True)
 
         ##############################################################################################################
 
@@ -136,7 +153,18 @@ class Trainer:
 
         self.max_grad_norm = 10.0
         self.previous_time = None
-
+        self.delta_mean = None
+        self.rtf_ema_ratio = getattr(self.config, "rtf_ema_ratio", 0.9) 
+        self.eval_interval = getattr(self.config, "eval_interval", 0)      # 0 => disable
+        self.eval_frames = getattr(self.config, "eval_num_output_frames", 21)
+        self.eval_init = getattr(self.config, "eval_num_init_frames", 3)
+        self.rtf_single_gpu_batch = getattr(self.config, "rtf_single_gpu_batch", 1)
+        self.given_first_chunk = getattr(self.config, "given_first_chunk", True)
+        if self.eval_interval:
+            self.pipeline = CausalDiffusionInferencePipeline(config, device=self.device)
+            self.pipeline.generator = self.model.generator
+            self.pipeline.text_encoder = self.model.text_encoder
+            
     def save(self):
         print("Start gathering distributed model states...")
         generator_state_dict = fsdp_state_dict(
@@ -145,7 +173,7 @@ class Trainer:
         if self.config.ema_start_step < self.step:
             state_dict = {
                 "generator": generator_state_dict,
-                "generator_ema": self.generator_ema.state_dict(),
+                "generator_ema": self.generator_ema.full_state_dict(self.model.generator),
             }
         else:
             state_dict = {
@@ -169,11 +197,12 @@ class Trainer:
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
         if not self.config.load_raw_video:  # precomputed latent
-            clean_latent = batch["ode_latent"][:, -1].to(
+            clean_latent = batch["clean_latent"].to(
                 device=self.device, dtype=self.dtype)
         else:  # encode raw video to latent
             frames = batch["frames"].to(
                 device=self.device, dtype=self.dtype)
+           
             with torch.no_grad():
                 clean_latent = self.model.vae.encode_to_latent(
                     frames).to(device=self.device, dtype=self.dtype)
@@ -186,8 +215,7 @@ class Trainer:
         # Step 2: Extract the conditional infos
         with torch.no_grad():
             conditional_dict = self.model.text_encoder(
-                text_prompts=text_prompts)
-
+                text_prompts=text_prompts) 
             if not getattr(self, "unconditional_dict", None):
                 unconditional_dict = self.model.text_encoder(
                     text_prompts=[self.config.negative_prompt] * batch_size)
@@ -229,26 +257,13 @@ class Trainer:
                 logging.info("DistGarbageCollector: Running GC.")
             gc.collect()
 
-        # Step 5. Create EMA params
-        # TODO: Implement EMA
-
-    def generate_video(self, pipeline, prompts, image=None):
-        batch_size = len(prompts)
-        sampled_noise = torch.randn(
-            [batch_size, 21, 16, 60, 104], device="cuda", dtype=self.dtype
-        )
-        video, _ = pipeline.inference(
-            noise=sampled_noise,
-            text_prompts=prompts,
-            return_latents=True
-        )
-        current_video = video.permute(0, 1, 3, 4, 2).cpu().numpy() * 255.0
-        return current_video
 
     def train(self):
+
         while True:
             batch = next(self.dataloader)
             self.train_one_step(batch)
+                
             if (not self.config.no_save) and self.step % self.config.log_iters == 0:
                 torch.cuda.empty_cache()
                 self.save()
