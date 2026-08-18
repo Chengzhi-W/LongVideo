@@ -16,7 +16,12 @@ def main() -> None:
 
     config = OmegaConf.load(args.config)
     expected = {
+        "generator_ckpt": "checkpoints/chunkwise/causal_ode.pt",
+        "real_name": "Wan2.1-T2V-1.3B",
         "use_memory_dmd": True,
+        "ar_teacher_name": "Wan2.1-T2V-1.3B",
+        "ar_teacher_ckpt": (
+            "checkpoints/chunkwise/ar_diffusion_long_sink_recent.pt"),
         "memory_control_type": "empty",
         "memory_history_layout": "rolling_sink_recent",
         "memory_sink_frames": 3,
@@ -28,7 +33,11 @@ def main() -> None:
         "ar_teacher_kwargs.frame_seq_length": 1560,
     }
     actual = {
+        "generator_ckpt": str(config.generator_ckpt),
+        "real_name": str(config.real_name),
         "use_memory_dmd": bool(config.use_memory_dmd),
+        "ar_teacher_name": str(config.ar_teacher_name),
+        "ar_teacher_ckpt": str(config.ar_teacher_ckpt),
         "memory_control_type": str(config.memory_control_type),
         "memory_history_layout": str(config.memory_history_layout),
         "memory_sink_frames": int(config.memory_sink_frames),

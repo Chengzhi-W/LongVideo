@@ -18,6 +18,24 @@ The locked subset is selected from `long.csv` with:
 - temporal crop: deterministic per `seed:clip_id`
 - output: 249 frames at 16fps, center-cropped to 480x832
 
+## Model prerequisites
+
+The validated long-teacher and senior chunkwise DMD path uses
+`Wan2.1-T2V-1.3B` throughout. It requires:
+
+```text
+wan_models/Wan2.1-T2V-1.3B/
+checkpoints/chunkwise/ar_diffusion.pt
+checkpoints/chunkwise/causal_ode.pt
+```
+
+The first checkpoint initializes AR-teacher fine-tuning; the second initializes
+the downstream DMD student. The main DMD config also deliberately sets its
+BiWan real-score model to `Wan2.1-T2V-1.3B`, matching the supplied senior
+chunkwise configuration. The 14B Wan checkpoint is needed only for retained
+upstream/reference YAML files whose `real_name` is explicitly
+`Wan2.1-T2V-14B`; it is not a prerequisite for this handoff pipeline.
+
 ## 1. Download metadata and lock the manifest
 
 ```bash

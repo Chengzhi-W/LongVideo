@@ -157,20 +157,45 @@ python setup.py develop
 
 ### Base models
 
+The validated main route in this repository uses the **1.3B Wan model for all
+three roles**: the student backbone, the BiWan real-score model, and the AR
+teacher. Download these artifacts before preprocessing or training:
+
 ```bash
 hf download Wan-AI/Wan2.1-T2V-1.3B \
   --local-dir wan_models/Wan2.1-T2V-1.3B
 
 hf download zhuhz22/Causal-Forcing chunkwise/ar_diffusion.pt \
   --local-dir checkpoints
+
+hf download zhuhz22/Causal-Forcing chunkwise/causal_ode.pt \
+  --local-dir checkpoints
 ```
 
-The AR-teacher pipeline expects:
+The AR-teacher pipeline expects the first two paths; the downstream DMD run
+also needs `causal_ode.pt`:
 
 ```text
 wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
 checkpoints/chunkwise/ar_diffusion.pt
+checkpoints/chunkwise/causal_ode.pt
 ```
+
+The 14B checkpoint is **not required** for the senior chunkwise protocol or the
+main long-AR-teacher experiment: both explicitly set
+`real_name: Wan2.1-T2V-1.3B`. Some retained upstream/reference configs,
+including `configs/causal_forcing_dmd_chunkwise.yaml` and the framewise DMD
+configs, still use `Wan2.1-T2V-14B`. Download it only if you intentionally run
+one of those configs:
+
+```bash
+hf download Wan-AI/Wan2.1-T2V-14B \
+  --local-dir wan_models/Wan2.1-T2V-14B
+```
+
+Always check the selected YAML's `real_name` before downloading large model
+weights. Changing the main config from 1.3B to 14B is an experiment change, not
+a missing setup step.
 
 ## Long-history AR teacher
 
