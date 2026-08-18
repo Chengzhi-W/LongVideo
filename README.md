@@ -233,19 +233,21 @@ tools/run_vbench_lrl_t750_step600_seed0_quality7.sh
 ### Current reference snapshot
 
 This table records a controlled step-600 snapshot, not a final model claim.
-It makes the current optimization target explicit: A18−A6 improves several
-consistency dimensions but still sacrifices too much Dynamic Degree.
+All three runs use the same 15-second, all-rank seed-0 VBench protocol. The
+ungated A18−A6 run is retained as an ablation; the reported method is A18−A6
+with the `t < 750` memory gate.
 
-| Metric | Baseline step600 | A18−A6 step600 | Δ |
+| Metric | Baseline step600 | A18−A6 ungated | A18−A6 `t < 750` |
 |---|---:|---:|---:|
-| Subject Consistency | 92.57 | 93.21 | +0.64 |
-| Background Consistency | 93.79 | 94.70 | +0.91 |
-| Temporal Flickering | 99.05 | 99.01 | −0.04 |
-| Motion Smoothness | 98.42 | 98.81 | +0.39 |
-| Aesthetic Quality | 67.20 | 67.31 | +0.11 |
-| Imaging Quality | 70.83 | 70.10 | −0.73 |
-| Dynamic Degree | 72.22 | 58.06 | −14.17 |
-| Quality7 | 84.60 | 83.91 | −0.69 |
+| Subject Consistency | 92.57 | 93.21 | **93.45** |
+| Background Consistency | 93.79 | **94.70** | 94.27 |
+| Temporal Flickering | **99.05** | 99.01 | 99.04 |
+| Motion Smoothness | 98.42 | **98.81** | 98.38 |
+| Aesthetic Quality | 67.20 | 67.31 | **67.32** |
+| Imaging Quality | **70.83** | 70.10 | 70.49 |
+| Dynamic Degree | 72.22 | 58.06 | **76.67** |
+| Quality6 (no TF) | 82.27 | 81.47 | **82.91** |
+| Quality7 | 84.60 | 83.91 | **85.14** |
 
 ## Repository layout
 
