@@ -455,6 +455,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.local_attn_size = local_attn_size
+        self.sink_size = sink_size
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
@@ -570,14 +571,34 @@ class CausalWanModel(ModelMixin, ConfigMixin):
     @staticmethod
     def _prepare_teacher_forcing_mask(
         device: torch.device | str, num_frames: int = 21,
-        frame_seqlen: int = 1560, num_frame_per_block=1
+        frame_seqlen: int = 1560, num_frame_per_block=1,
+        local_attn_size: int = -1, sink_size: int = 0,
     ) -> BlockMask:
+        """Build a teacher-forcing mask matching the inference KV cache.
+
+        The input sequence is ``[clean context][noisy targets]``.  A noisy block
+        sees its own noisy tokens and only the clean history that would remain in
+        the rolling inference cache.  For the long-video AR teacher,
+        ``local_attn_size=21``, ``sink_size=3`` and a three-frame block produce
+        exactly ``sink3 + recent15 + current3``.  ``local_attn_size=-1`` retains
+        the original full-history behavior.
         """
-        we will divide the token sequence into the following format
-        [1 latent frame] [1 latent frame] ... [1 latent frame]
-        We use flexattention to construct the attention mask
-        """
-        # debug
+        if num_frames <= 0 or frame_seqlen <= 0 or num_frame_per_block <= 0:
+            raise ValueError(
+                "num_frames, frame_seqlen and num_frame_per_block must be positive")
+        if num_frames % num_frame_per_block != 0:
+            raise ValueError(
+                f"num_frames={num_frames} must be divisible by "
+                f"num_frame_per_block={num_frame_per_block}")
+        if sink_size < 0:
+            raise ValueError(f"sink_size must be non-negative, got {sink_size}")
+        if local_attn_size != -1:
+            minimum_cache = sink_size + num_frame_per_block
+            if local_attn_size < minimum_cache:
+                raise ValueError(
+                    "local_attn_size must fit sink plus the current block: "
+                    f"{local_attn_size} < {sink_size}+{num_frame_per_block}")
+
         DEBUG = False
         if DEBUG:
             num_frames = 9
@@ -589,13 +610,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         padded_length = math.ceil(total_length / 128) * 128 - total_length
 
         clean_ends = num_frames * frame_seqlen
-        # for clean context frames, we can construct their flex attention mask based on a [start, end] interval
-        context_ends = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
-        # for noisy frames, we need two intervals to construct the flex attention mask [context_start, context_end] [noisy_start, noisy_end]
-        noise_context_starts = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
-        noise_context_ends = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
-        noise_noise_starts = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
-        noise_noise_ends = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
+        mask_length = total_length + padded_length
+        context_recent_starts = torch.zeros(
+            mask_length, device=device, dtype=torch.long)
+        context_ends = torch.zeros(mask_length, device=device, dtype=torch.long)
+        noise_context_recent_starts = torch.zeros(
+            mask_length, device=device, dtype=torch.long)
+        noise_context_ends = torch.zeros(mask_length, device=device, dtype=torch.long)
+        noise_noise_starts = torch.zeros(mask_length, device=device, dtype=torch.long)
+        noise_noise_ends = torch.zeros(mask_length, device=device, dtype=torch.long)
 
         # Block-wise causal mask will attend to all elements that are before the end of the current chunk
         attention_block_size = frame_seqlen * num_frame_per_block
@@ -606,9 +629,30 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             device=device, dtype=torch.long
         )
 
-        # attention for clean context frames
+        sink_tokens = sink_size * frame_seqlen
+        if local_attn_size == -1:
+            clean_recent_capacity = None
+            noisy_recent_capacity = None
+        else:
+            # The clean block itself occupies num_frame_per_block slots in the
+            # inference cache.  The noisy half holds that block separately, so its
+            # clean recent history is shorter by exactly one block.
+            clean_recent_capacity = (
+                local_attn_size - sink_size) * frame_seqlen
+            noisy_recent_capacity = (
+                local_attn_size - sink_size - num_frame_per_block
+            ) * frame_seqlen
+
+        # A clean block sees sink + rolling recent + itself, matching a cache commit.
         for start in frame_indices:
-            context_ends[start:start + attention_block_size] = start + attention_block_size
+            start_i = int(start.item())
+            end_i = min(start_i + attention_block_size, clean_ends)
+            recent_start = (
+                0 if clean_recent_capacity is None
+                else max(sink_tokens, end_i - clean_recent_capacity)
+            )
+            context_recent_starts[start_i:end_i] = recent_start
+            context_ends[start_i:end_i] = end_i
 
         noisy_image_start_list = torch.arange(
             num_frames * frame_seqlen, total_length,
@@ -617,29 +661,43 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         )
         noisy_image_end_list = noisy_image_start_list + attention_block_size
 
-        # attention for noisy frames
+        # A noisy block sees clean sink + recent history and its own noisy block;
+        # the clean version of the current block is deliberately excluded.
         for block_index, (start, end) in enumerate(zip(noisy_image_start_list, noisy_image_end_list)):
-            # attend to noisy tokens within the same block
             noise_noise_starts[start:end] = start
             noise_noise_ends[start:end] = end
-            # attend to context tokens in previous blocks
-            # noise_context_starts[start:end] = 0
-            noise_context_ends[start:end] = block_index * attention_block_size
+            history_end = block_index * attention_block_size
+            recent_start = (
+                0 if noisy_recent_capacity is None
+                else max(sink_tokens, history_end - noisy_recent_capacity)
+            )
+            noise_context_recent_starts[start:end] = recent_start
+            noise_context_ends[start:end] = history_end
 
         def attention_mask(b, h, q_idx, kv_idx):
-            # first design the mask for clean frames
-            clean_mask = (q_idx < clean_ends) & (kv_idx < context_ends[q_idx])
-            # then design the mask for noisy frames
-            # noisy frames will attend to all clean preceeding clean frames + itself
-            C1 = (kv_idx < noise_noise_ends[q_idx]) & (kv_idx >= noise_noise_starts[q_idx])
-            C2 = (kv_idx < noise_context_ends[q_idx]) & (kv_idx >= noise_context_starts[q_idx])
-            noise_mask = (q_idx >= clean_ends) & (C1 | C2)
+            clean_history = (kv_idx < context_ends[q_idx]) & (
+                (kv_idx < sink_tokens) |
+                (kv_idx >= context_recent_starts[q_idx])
+            )
+            clean_mask = (q_idx < clean_ends) & clean_history
+
+            same_noisy_block = (
+                (kv_idx < noise_noise_ends[q_idx]) &
+                (kv_idx >= noise_noise_starts[q_idx])
+            )
+            clean_history_for_noisy = (kv_idx < noise_context_ends[q_idx]) & (
+                (kv_idx < sink_tokens) |
+                (kv_idx >= noise_context_recent_starts[q_idx])
+            )
+            noise_mask = (q_idx >= clean_ends) & (
+                same_noisy_block | clean_history_for_noisy)
 
             eye_mask = q_idx == kv_idx
             return eye_mask | clean_mask | noise_mask
 
-        block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
-                                       KV_LEN=total_length + padded_length, _compile=False, device=device)
+        block_mask = create_block_mask(
+            attention_mask, B=None, H=None, Q_LEN=mask_length,
+            KV_LEN=mask_length, _compile=False, device=device)
 
         if DEBUG:
             print(block_mask)
@@ -924,6 +982,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             int(x.shape[-1]),
             int(self.num_frame_per_block),
             int(self.local_attn_size),
+            int(self.sink_size),
         )
         if self.block_mask is None or self.block_mask_signature != mask_signature:
             if clean_x is not None: # TF
@@ -933,7 +992,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     self.block_mask = self._prepare_teacher_forcing_mask(
                         device, num_frames=x.shape[2],
                         frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
-                        num_frame_per_block=self.num_frame_per_block
+                        num_frame_per_block=self.num_frame_per_block,
+                        local_attn_size=self.local_attn_size,
+                        sink_size=self.sink_size,
                     )
             else: # DF?
                 if self.independent_first_frame:

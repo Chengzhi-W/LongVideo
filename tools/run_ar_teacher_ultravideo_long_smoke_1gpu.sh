@@ -30,6 +30,7 @@ done
 mkdir -p "$LOGDIR"
 
 cd "$BASE"
+"$PYTHON" tools/audit_sink_recent_teacher_forcing.py --config "$CONFIG"
 "$PYTHON" -m torch.distributed.run \
   --nproc_per_node=1 \
   --nnodes=1 \
@@ -54,4 +55,7 @@ grep -q 'Reached max_steps=2' "$LOGDIR/train.log" || {
   echo "SMOKE_DID_NOT_REACH_MAX_STEPS" >&2
   exit 1
 }
+"$PYTHON" tools/audit_ar_teacher_checkpoint.py \
+  --base "$BASE/checkpoints/chunkwise/ar_diffusion.pt" \
+  --tuned "$LOGDIR/checkpoint_model_000002/model.pt"
 echo "AR_TEACHER_LONG_SMOKE_COMPLETE:$LOGDIR"
