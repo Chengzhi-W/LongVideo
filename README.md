@@ -2,7 +2,7 @@
 
 # LongVideo Memory-DMD
 
-### Long-history autoregressive video generation with controllable consistency–dynamics balance
+### Teacher adaptation and counterfactual control for long-video Memory-DMD
 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Backbone](https://img.shields.io/badge/Backbone-Wan2.1--T2V--1.3B-6A5ACD)](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B)
@@ -10,10 +10,10 @@
 [![Data](https://img.shields.io/badge/Data-UltraVideo--Long-F39C12)](https://huggingface.co/datasets/APRIL-AIGC/UltraVideo-Long)
 [![Status](https://img.shields.io/badge/Status-Research--in--progress-E74C3C)](#project-status)
 
-This repository contains our long-video research stack built on Causal Forcing:
-sink/recent long-AR-teacher fine-tuning, ungated Memory-DMD, the experimental
-**Long-vs-Local (A18−A6)** control, 15-second inference, and locked VBench
-reproduction tools.
+This repository studies two complementary ways to make memory supervision
+reliable in long-video DMD: adapt the AR teacher to the deployed long-history
+cache, or control the history counterfactual without fine-tuning the teacher.
+It includes 15-second inference and locked VBench reproduction tools.
 
 [Method](#method) · [Quick start](#quick-start) · [AR teacher](#long-history-ar-teacher) ·
 [DMD experiments](#memory-dmd-experiments) · [Evaluation](#evaluation) ·
@@ -32,26 +32,18 @@ Long-video autoregressive generation exposes a recurring trade-off:
 - a short-context AR teacher cannot reliably supervise behavior outside its
   original temporal domain.
 
+The original history-vs-empty residual combines two failure modes: its history
+branch can be out of distribution for a five-second AR teacher, and removing all
+history changes identity, local motion, and the video start-state prior at once.
+This repository separates those causes instead of treating “memory strength” as
+the only variable.
+
 Our goal is to improve long-range identity and scene consistency **without
 turning the video into a static continuation of its recent state**.
 
 ## Method
 
-### Current training path
-
-The first controlled experiment is intentionally minimal:
-
-1. fine-tune the AR teacher with `sink3 + recent15 + current3` on a 63-latent
-   timeline;
-2. freeze that teacher and train the student with the original mem1
-   history-vs-empty residual at every DMD timestep;
-3. do **not** enable `t < 750` gating or Long-vs-Local in this main run.
-
-Long-vs-Local remains an AR-teacher-finetuning-free mechanism experiment and a
-fallback ablation. It is not completely training-free because the student still
-requires DMD training when that residual is used.
-
-### 1. Memory-DMD baseline
+### 1. Problem: unreliable history-vs-empty supervision
 
 The original memory residual compares an AR teacher with full history against
 the same teacher without history:
@@ -63,7 +55,7 @@ m_raw = A18 - A0
 This counterfactual is not clean: removing all history changes identity,
 local motion, and the start-state prior at the same time.
 
-### 2. Long-vs-Local History DMD
+### 2. Route A: Long-vs-Local without AR-teacher fine-tuning
 
 We instead compare full history with a recent local history:
 
@@ -90,9 +82,34 @@ noise, timesteps, text conditions, and current-query RoPE positions. The
 six-frame branch is prefetched from an empty cache so it cannot leak the older
 12 frames through cached keys and values.
 
-### 3. Long-history AR teacher
+This route is **AR-teacher-finetuning-free**, not fully training-free: the DMD
+student still has to be trained with the Long-vs-Local residual.
 
-We also provide an end-to-end pipeline for fine-tuning the AR teacher on
+### 3. Route B (main): adapted long AR teacher with basic mem1
+
+The main route first makes the history branch in-distribution. The AR teacher is
+fine-tuned on a 63-latent timeline while using exactly the cache it will see at
+deployment:
+
+```text
+sink3 + recent15 + current3 noisy latents
+```
+
+Absolute RoPE positions remain on the full 63-latent timeline. After teacher
+fine-tuning, the first controlled DMD experiment returns to the simplest mem1:
+
+```text
+m_tuned = A_long(sink3 + recent15) - A_long(empty)
+```
+
+It uses scale 1, the senior nonorm behavior, and every DMD timestep. It contains
+neither `t < 750` nor Long-vs-Local. Those remain separate fallback ablations,
+so a positive result can be attributed to teacher adaptation rather than a
+mixture of three changes.
+
+### 4. End-to-end pipeline
+
+The repository provides an end-to-end pipeline for fine-tuning the AR teacher on
 15-second UltraVideo-Long clips:
 
 ```mermaid
@@ -127,7 +144,7 @@ flowchart LR
 ### Environment
 
 ```bash
-git clone https://github.com/Chengzhi-W/LongVideo.git
+git clone --branch main --single-branch https://github.com/Chengzhi-W/LongVideo.git
 cd LongVideo
 
 conda create -n longvideo python=3.10 -y
@@ -194,12 +211,12 @@ NPROC_PER_NODE=8 bash tools/ultravideo_long_5k.sh encode-long
 bash tools/ultravideo_long_5k.sh build-long
 ```
 
-### Two-node training
+### Two-node / 16-GPU training
 
 The production configuration is open-ended. It does **not** force a maximum
 step; checkpoints are written every 100 steps and the operator chooses when to
-stop. The default topology is 2 nodes × 8 GPUs, batch 1 per GPU, global batch
-16, seed 42.
+stop. The locked topology is 2 nodes × 8 GPUs, batch 1 per GPU, global batch 16,
+seed 42.
 
 ```bash
 export WANDB_API_KEY=<your-key>
@@ -215,7 +232,11 @@ NODE_RANK=1 MASTER_ADDR=<node-0-ip> \
 
 The launcher resolves the repository root automatically, so the clone may be
 placed anywhere as long as checkpoints and LMDB use the documented relative
-paths.
+paths. The AR trainer does not implement gradient accumulation. The launcher
+therefore rejects a world-size/global-batch mismatch before loading model
+weights. An 8-GPU run needs an explicitly reviewed config with global batch 8
+(or a separately validated per-GPU batch 2); it is not the same locked protocol
+as the 16-GPU run.
 
 ## Memory-DMD experiments
 
@@ -227,6 +248,14 @@ paths.
 | Long-vs-Local | A18−A6 | none | `configs/causal_forcing_dmd_chunkwise_long_vs_local_joint_nogate_step1500.yaml` |
 | Long-vs-Local gated | A18−A6 | `t < 750` | `configs/causal_forcing_dmd_chunkwise_long_vs_local_joint_t750.yaml` |
 | Gated open-ended | A18−A6 | `t < 750` | `configs/causal_forcing_dmd_chunkwise_long_vs_local_joint_t750_openended.yaml` |
+
+Before launching the main DMD experiment, install the selected teacher
+checkpoint at the path in its config and run:
+
+```bash
+python tools/audit_long_teacher_mem1_config.py \
+  --config configs/causal_forcing_dmd_chunkwise_long_ar_teacher_mem1_ungated.yaml
+```
 
 All comparison runs should keep the initial checkpoint, seed, global batch,
 prompt stream, frame count, and checkpoint selection fixed.
@@ -257,10 +286,11 @@ tools/run_vbench_lrl_t750_step600_seed0_quality7.sh
 
 ### Current reference snapshot
 
-This table records a controlled step-600 snapshot, not a final model claim.
-All three runs use the same 15-second, all-rank seed-0 VBench protocol. The
-ungated A18−A6 run is retained as an ablation; the reported method is A18−A6
-with the `t < 750` memory gate.
+This table records the earlier AR-teacher-finetuning-free ablation, not a result
+for the new adapted-teacher main route. All three runs use the same 15-second,
+all-rank seed-0 VBench protocol. It shows that counterfactual control and the
+optional gate can recover the consistency–dynamics balance without tuning the
+old teacher; the tuned-teacher mem1 result is still pending.
 
 | Metric | Baseline step600 | A18−A6 ungated | A18−A6 `t < 750` |
 |---|---:|---:|---:|
@@ -291,9 +321,9 @@ LongVideo/
 └── long_video/              packaged/mirrored long-video modules
 ```
 
-The root modules are the validated execution path used by the handoff scripts.
-The `long_video/` tree is retained for compatibility with the packaged variant
-of the original project.
+The root modules are the validated execution path used by every handoff command
+in this README. The `long_video/` tree is an upstream compatibility snapshot;
+do not launch the new AR-teacher or Memory-DMD experiments from that subtree.
 
 ## Reproducibility and artifact policy
 
@@ -325,6 +355,11 @@ On Blackwell, the fixed FlexAttention Triton schedule exceeded per-block shared
 resources. The handoff launchers therefore default to
 `max-autotune-no-cudagraphs`, which selected valid equivalent forward and
 backward kernels.
+
+This validates the one-GPU code path and checkpoint format. It does not claim
+that a full 5K/2K-step run has completed, that the two-node collective path has
+already been exercised end to end, or that the tuned-teacher mem1 quality result
+is known. Those are the next production experiments.
 
 ## Acknowledgements
 

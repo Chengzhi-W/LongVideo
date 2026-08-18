@@ -35,6 +35,26 @@ mkdir -p "$LOGDIR/wandb"
 
 cd "$BASE"
 "$PYTHON" tools/audit_sink_recent_teacher_forcing.py --config "$CONFIG"
+"$PYTHON" - "$CONFIG" "$NNODES" "$NPROC_PER_NODE" <<'PY'
+import sys
+from omegaconf import OmegaConf
+
+config = OmegaConf.load(sys.argv[1])
+world_size = int(sys.argv[2]) * int(sys.argv[3])
+effective_global_batch = world_size * int(config.batch_size)
+configured_global_batch = int(config.total_batch_size)
+if effective_global_batch != configured_global_batch:
+    raise SystemExit(
+        "WORLD_SIZE_GLOBAL_BATCH_MISMATCH: "
+        f"nnodes*nproc_per_node*batch_size={effective_global_batch}, "
+        f"but total_batch_size={configured_global_batch}; "
+        "this trainer has no gradient accumulation"
+    )
+print(
+    "AR_TEACHER_DISTRIBUTED_AUDIT_OK:"
+    f"world_size={world_size}:global_batch={effective_global_batch}"
+)
+PY
 "$PYTHON" -m torch.distributed.run \
   --nproc_per_node="$NPROC_PER_NODE" \
   --nnodes="$NNODES" \
