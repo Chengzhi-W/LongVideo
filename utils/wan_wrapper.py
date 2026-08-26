@@ -120,6 +120,9 @@ class WanDiffusionWrapper(torch.nn.Module):
             is_causal=False,
             local_attn_size=-1,
             sink_size=0,
+            slow_context_size=0,
+            fast_context_size=0,
+            slow_context_stride_blocks=2,
             max_num_frames=21,
             frame_seq_length=1560,
     ):
@@ -127,7 +130,13 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         if is_causal:
             self.model = CausalWanModel.from_pretrained(
-                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                f"wan_models/{model_name}/",
+                local_attn_size=local_attn_size,
+                sink_size=sink_size,
+                slow_context_size=slow_context_size,
+                fast_context_size=fast_context_size,
+                slow_context_stride_blocks=slow_context_stride_blocks,
+            )
         else:
             self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
         self.model.eval()
@@ -235,8 +244,10 @@ class WanDiffusionWrapper(torch.nn.Module):
         concat_time_embeddings: Optional[bool] = False, #DF
         clean_x: Optional[torch.Tensor] = None, # TF
         aug_t: Optional[torch.Tensor] = None, # for TF clean GT, if it's also noisy and needs denoising by the model, aug_t is its timestep
+        teacher_forcing_target_frame_indices: Optional[torch.Tensor] = None,
 
-        cache_start: Optional[int] = None
+        cache_start: Optional[int] = None,
+        cache_commit: Optional[bool] = None,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -245,11 +256,17 @@ class WanDiffusionWrapper(torch.nn.Module):
         actual_frame_seq = ((height + patch_h - 1) // patch_h) * (
             (width + patch_w - 1) // patch_w
         )
-        required_seq_len = num_frames * actual_frame_seq
+        capacity_frames = num_frames
+        if clean_x is not None:
+            if clean_x.shape[-2:] != noisy_image_or_video.shape[-2:]:
+                raise ValueError(
+                    "clean_x and noisy_image_or_video must have the same spatial shape")
+            capacity_frames = max(capacity_frames, int(clean_x.shape[1]))
+        required_seq_len = capacity_frames * actual_frame_seq
         if required_seq_len > self.seq_len:
             raise RuntimeError(
                 "Input exceeds configured Wan sequence capacity: "
-                f"{num_frames} frames * {actual_frame_seq} tokens/frame = "
+                f"{capacity_frames} frames * {actual_frame_seq} tokens/frame = "
                 f"{required_seq_len} > {self.seq_len}. Set model_kwargs.max_num_frames "
                 "and model_kwargs.frame_seq_length for this training resolution."
             )
@@ -263,6 +280,8 @@ class WanDiffusionWrapper(torch.nn.Module):
         logits = None
         # X0 prediction
         if kv_cache is not None:
+            if cache_commit is None:
+                cache_commit = bool(torch.all(timestep == 0).item())
             flow_pred = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,
@@ -270,7 +289,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
-                cache_start=cache_start
+                cache_start=cache_start,
+                cache_commit=cache_commit,
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
@@ -281,6 +301,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     seq_len=self.seq_len,
                     clean_x=clean_x.permute(0, 2, 1, 3, 4), # => [B, C, F, H, W]
                     aug_t=aug_t,
+                    teacher_forcing_target_frame_indices=teacher_forcing_target_frame_indices,
                 ).permute(0, 2, 1, 3, 4)
             else:
                 # diffusion forcing or bidirectional

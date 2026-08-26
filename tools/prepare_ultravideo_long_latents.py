@@ -34,7 +34,10 @@ def parse_args() -> argparse.Namespace:
         "--num-frames",
         type=int,
         required=True,
-        help="Pixel frames per clip: use 81 for 21 latents or 249 for 63 latents.",
+        help=(
+            "Pixel frames per clip: use 81 for 21 latents, 249 for 63 latents, "
+            "or 321 for 81 latents (20 seconds at 16 fps)."
+        ),
     )
     parser.add_argument("--fps", type=float, default=16.0)
     parser.add_argument("--height", type=int, default=480)
@@ -55,6 +58,14 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Validate paths and print the plan without importing GPU models.",
+    )
+    parser.add_argument(
+        "--skip-too-short",
+        action="store_true",
+        help=(
+            "Skip manifest rows whose duration column is shorter than the "
+            "requested temporal window instead of failing during decode."
+        ),
     )
     return parser.parse_args()
 
@@ -187,6 +198,20 @@ def main() -> int:
         raise ValueError("--height and --width must be divisible by 16")
 
     rows = load_manifest(args.manifest.resolve(), args.split)
+    if args.skip_too_short:
+        window_seconds = (args.num_frames - 1) / args.fps
+        kept_rows = []
+        skipped = 0
+        for row in rows:
+            duration = row.get("duration", "").strip()
+            if duration and float(duration) + 1e-3 < window_seconds:
+                skipped += 1
+                continue
+            kept_rows.append(row)
+        rows = kept_rows
+        print(
+            f"[duration filter] kept {len(rows)} rows and skipped {skipped} "
+            f"shorter than {window_seconds:.3f}s")
     if args.limit:
         rows = rows[: args.limit]
     rank = int(os.environ.get("RANK", "0"))

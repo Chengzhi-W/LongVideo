@@ -48,6 +48,21 @@ case "$ACTION" in
       --output "$ROOT/dataset/UltraVideo-Long-debug/clean_data_63_240x416" \
       --map-size-gb 64
     ;;
+  debug-encode-20s)
+    "$PYTHON" -m torch.distributed.run --standalone --nproc_per_node=1 \
+      "$ROOT/tools/prepare_ultravideo_long_latents.py" \
+      --manifest "$ROOT/dataset/UltraVideo-Long-debug/manifests/train.csv" \
+      --videos-dir "$ROOT/dataset/UltraVideo-Long-debug/videos" \
+      --output-dir "$ROOT/dataset/UltraVideo-Long-debug/latents_81_240x416" \
+      --num-frames 321 --fps 16 --height 240 --width 416 --seed 42 \
+      --skip-too-short
+    ;;
+  debug-build-20s)
+    "$PYTHON" "$ROOT/tools/build_ultravideo_long_lmdb.py" \
+      --latents-dir "$ROOT/dataset/UltraVideo-Long-debug/latents_81_240x416" \
+      --output "$ROOT/dataset/UltraVideo-Long-debug/clean_data_81_240x416" \
+      --map-size-gb 64
+    ;;
   check)
     "$PYTHON" "$ROOT/tools/prepare_ultravideo_long_latents.py" \
       --manifest "$FULL_MANIFEST" \
@@ -71,6 +86,15 @@ case "$ACTION" in
       --output-dir "$DATA_ROOT/latents_21" \
       --num-frames 81 --fps 16 --height 480 --width 832 --seed 42
     ;;
+  encode-20s)
+    "$PYTHON" -m torch.distributed.run --standalone --nproc_per_node="${NPROC_PER_NODE:-8}" \
+      "$ROOT/tools/prepare_ultravideo_long_latents.py" \
+      --manifest "$FULL_MANIFEST" \
+      --videos-dir "$DATA_ROOT/videos" \
+      --output-dir "$DATA_ROOT/latents_81" \
+      --num-frames 321 --fps 16 --height 480 --width 832 --seed 42 \
+      --skip-too-short
+    ;;
   build-long)
     "$PYTHON" "$ROOT/tools/build_ultravideo_long_lmdb.py" \
       --latents-dir "$DATA_ROOT/latents_63" \
@@ -80,6 +104,11 @@ case "$ACTION" in
     "$PYTHON" "$ROOT/tools/build_ultravideo_long_lmdb.py" \
       --latents-dir "$DATA_ROOT/latents_21" \
       --output "$DATA_ROOT/clean_data_21"
+    ;;
+  build-20s)
+    "$PYTHON" "$ROOT/tools/build_ultravideo_long_lmdb.py" \
+      --latents-dir "$DATA_ROOT/latents_81" \
+      --output "$DATA_ROOT/clean_data_81"
     ;;
   help|-h|--help)
     cat <<'EOF'
@@ -91,11 +120,15 @@ Actions (each is safe to rerun unless noted):
   debug-download  Range-fetch DEBUG_COUNT=4 selected videos (no full ZIPs)
   debug-encode    Encode 249 frames -> 63 latents at smoke resolution 240x416
   debug-build     Build the smoke LMDB consumed by the one-GPU config
+  debug-encode-20s  Encode all >=20s debug clips: 321 frames -> 81 latents
+  debug-build-20s   Build the 81-latent smoke LMDB
   check        Validate the first LIMIT=8 videos without loading a GPU model
   encode-long  Encode 249 pixel frames -> 63 Wan latent frames on 8 GPUs
   encode-5s    Encode 81 pixel frames -> 21 Wan latent frames on 8 GPUs
+  encode-20s   Encode >=20s clips: 321 pixel frames -> 81 Wan latents
   build-long   Atomically build the 63-latent LMDB (must not already exist)
   build-5s     Atomically build the 21-latent LMDB (must not already exist)
+  build-20s    Atomically build the 81-latent LMDB (must not already exist)
 
 Optional environment variables: ROOT, PYTHON, DATA_ROOT, NPROC_PER_NODE, LIMIT.
 EOF

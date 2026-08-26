@@ -32,8 +32,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.sample_solver = 'unipc'
         self.shift = args.timestep_shift
 
-        self.num_transformer_blocks = 30
-        self.frame_seq_length = 1560
+        self.num_transformer_blocks = len(self.generator.model.blocks)
+        self.frame_seq_length = self.generator.frame_seq_length
 
         self.kv_cache_pos = None
         self.kv_cache_neg = None
@@ -119,14 +119,18 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 self.crossattn_cache_neg[block_index]["is_init"] = False
             # reset kv cache
             for block_index in range(len(self.kv_cache_pos)):
-                self.kv_cache_pos[block_index]["global_end_index"] = torch.tensor(
-                    [0], dtype=torch.long, device=noise.device)
-                self.kv_cache_pos[block_index]["local_end_index"] = torch.tensor(
-                    [0], dtype=torch.long, device=noise.device)
-                self.kv_cache_neg[block_index]["global_end_index"] = torch.tensor(
-                    [0], dtype=torch.long, device=noise.device)
-                self.kv_cache_neg[block_index]["local_end_index"] = torch.tensor(
-                    [0], dtype=torch.long, device=noise.device)
+                for cache in (
+                    self.kv_cache_pos[block_index],
+                    self.kv_cache_neg[block_index],
+                ):
+                    cache["global_end_index"].zero_()
+                    cache["local_end_index"].zero_()
+                    if "source_frames" in cache:
+                        cache["source_frames"].fill_(-1)
+                        cache["sink_count"].zero_()
+                        cache["slow_count"].zero_()
+                        cache["fast_count"].zero_()
+                        cache["cache_origin_frame"].fill_(-1)
 
         # Step 2: Cache context feature
         current_start_frame = start_frame_index
@@ -145,7 +149,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     kv_cache=self.kv_cache_pos,
                     crossattn_cache=self.crossattn_cache_pos,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    cache_commit=True,
                 )
                 self.generator(
                     noisy_image_or_video=initial_latent[:, :1],
@@ -154,7 +159,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     kv_cache=self.kv_cache_neg,
                     crossattn_cache=self.crossattn_cache_neg,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    cache_commit=True,
                 )
                 current_start_frame += 1
                 cache_start_frame += 1
@@ -174,7 +180,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     kv_cache=self.kv_cache_pos,
                     crossattn_cache=self.crossattn_cache_pos,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    cache_commit=True,
                 )
                 self.generator(
                     noisy_image_or_video=current_ref_latents,
@@ -183,7 +190,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     kv_cache=self.kv_cache_neg,
                     crossattn_cache=self.crossattn_cache_neg,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    cache_commit=True,
                 )
                 current_start_frame += self.num_frame_per_block
                 cache_start_frame += self.num_frame_per_block
@@ -212,7 +220,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     kv_cache=self.kv_cache_pos,
                     crossattn_cache=self.crossattn_cache_pos,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    cache_commit=False,
                 )
                 flow_pred_uncond, _ = self.generator(
                     noisy_image_or_video=latent_model_input,
@@ -221,7 +230,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     kv_cache=self.kv_cache_neg,
                     crossattn_cache=self.crossattn_cache_neg,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    cache_commit=False,
                 )
 
                 flow_pred = flow_pred_uncond + self.args.guidance_scale * (
@@ -247,7 +257,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 kv_cache=self.kv_cache_pos,
                 crossattn_cache=self.crossattn_cache_pos,
                 current_start=current_start_frame * self.frame_seq_length,
-                cache_start=cache_start_frame * self.frame_seq_length
+                cache_start=cache_start_frame * self.frame_seq_length,
+                cache_commit=True,
             )
             self.generator(
                 noisy_image_or_video=latents,
@@ -256,7 +267,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 kv_cache=self.kv_cache_neg,
                 crossattn_cache=self.crossattn_cache_neg,
                 current_start=current_start_frame * self.frame_seq_length,
-                cache_start=cache_start_frame * self.frame_seq_length
+                cache_start=cache_start_frame * self.frame_seq_length,
+                cache_commit=True,
             )
 
             # Step 3.4: update the start and end frame indices
