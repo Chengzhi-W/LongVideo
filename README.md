@@ -85,27 +85,27 @@ six-frame branch is prefetched from an empty cache so it cannot leak the older
 This route is **AR-teacher-finetuning-free**, not fully training-free: the DMD
 student still has to be trained with the Long-vs-Local residual.
 
-### 3. Route B (main): adapted long AR teacher with basic mem1
+### 3. Route B (current): 20-second slow/fast AR teacher fine-tuning
 
-The main route first makes the history branch in-distribution. The AR teacher is
-fine-tuned on a 63-latent timeline while using exactly the cache it will see at
-deployment:
-
-```text
-sink3 + recent15 + current3 noisy latents
-```
-
-Absolute RoPE positions remain on the full 63-latent timeline. After teacher
-fine-tuning, the first controlled DMD experiment returns to the simplest mem1:
+The current project stage only fine-tunes the AR teacher. It uses normal flow
+matching on an 81-latent, 20-second timeline and the cache layout intended for
+long autoregressive inference:
 
 ```text
-m_tuned = A_long(sink3 + recent15) - A_long(empty)
+sink3 + slow sparse12 + fast recent3 + noisy current3 = 21 visible latents
 ```
 
-It uses scale 1, the senior nonorm behavior, and every DMD timestep. It contains
-neither `t < 750` nor Long-vs-Local. Those remain separate fallback ablations,
-so a positive result can be attributed to teacher adaptation rather than a
-mixture of three changes.
+The clean 81-latent trajectory remains available as context. For efficiency,
+each optimizer step randomly selects 12 of its 27 three-latent chunks as noisy
+flow-matching targets. The transformer therefore processes 81 clean context
+latents plus 36 noisy target latents instead of duplicating all 81 targets.
+Every chunk is sampled equally often across a balanced nine-pattern bank.
+
+Absolute RoPE positions remain on the full 81-latent timeline. There is no
+frequency decomposition, KV dropout, DMD loss, or random history removal in
+this stage. The downstream tuned-teacher mem1 experiment is deliberately left
+for the next stage; existing 15-second DMD results are historical references,
+not validation of this teacher.
 
 ### 4. End-to-end pipeline
 
@@ -133,9 +133,10 @@ flowchart LR
 - [x] Lock AR-teacher fine-tuning to 81 latent / 321 pixel frames at 16 fps.
 - [x] Build official-prompt VBench evaluation for seven quality dimensions.
 - [x] Build deterministic UltraVideo-Long 5K download and preprocessing.
-- [x] Pass a real-data, one-GPU, two-step AR-teacher smoke test.
+- [x] Pass a real-data, one-GPU, two-step **new 20-second** AR-teacher smoke test.
+- [x] Pass a one-GPU, one-step smoke test at the production latent resolution.
 - [ ] Fine-tune the long-history AR teacher on the full 5K subset.
-- [ ] Run ungated mem1 from the new sink/recent AR teacher.
+- [ ] Select a tuned checkpoint, then align downstream mem1 to the slow/fast cache.
 - [ ] Keep A18−A6 and `t < 750` as separate fallback ablations.
 - [ ] Select the final consistency–dynamics operating point.
 
@@ -210,11 +211,18 @@ randomly chooses one of nine balanced patterns and supervises 12 of the 27
 current chunks. Absolute RoPE positions are preserved across the full timeline;
 this is not full-history attention.
 
+Concretely, one training sample contains the full clean tensor
+`[81, 16, 60, 104]`. Twelve complete chunks (36 latent frames) are selected,
+noised at flow-matching timesteps, and appended as targets. The loss is computed
+only on those 36 targets. With the locked 16-GPU global batch, each optimizer
+step therefore supervises 192 target chunks. The nine-pattern bank keeps this
+sampling exactly balanced while bounding FlexAttention compilation variants.
+
 ### One-GPU preflight
 
 The smoke test keeps all 81 latent frames while reducing spatial resolution.
 It validates real video decoding, VAE encoding, LMDB loading, model loading,
-the exact sink/recent attention topology, forward/backward, optimizer updates,
+the exact sink/slow/fast attention topology, forward/backward, optimizer updates,
 and checkpoint serialization.
 
 ```bash
@@ -272,21 +280,18 @@ as the 16-GPU run.
 |---|---|---:|---|
 | Baseline | none | — | `configs/causal_forcing_dmd_chunkwise_senior_baseline.yaml` |
 | Senior mem1 | A18−A0 | none | `configs/causal_forcing_dmd_chunkwise_senior_mem1_nonorm.yaml` |
-| **Long-teacher mem1 (main)** | A_sink+recent−A0 | **none** | `configs/causal_forcing_dmd_chunkwise_long_ar_teacher_mem1_ungated.yaml` |
+| Tuned-teacher mem1 | pending until the 20s teacher is selected | pending | next stage |
 | Long-vs-Local | A18−A6 | none | `configs/causal_forcing_dmd_chunkwise_long_vs_local_joint_nogate_step1500.yaml` |
 | Long-vs-Local gated | A18−A6 | `t < 750` | `configs/causal_forcing_dmd_chunkwise_long_vs_local_joint_t750.yaml` |
 | Gated open-ended | A18−A6 | `t < 750` | `configs/causal_forcing_dmd_chunkwise_long_vs_local_joint_t750_openended.yaml` |
 
-Before launching the main DMD experiment, install the selected teacher
-checkpoint at the path in its config and run:
-
-```bash
-python tools/audit_long_teacher_mem1_config.py \
-  --config configs/causal_forcing_dmd_chunkwise_long_ar_teacher_mem1_ungated.yaml
-```
-
-All comparison runs should keep the initial checkpoint, seed, global batch,
-prompt stream, frame count, and checkpoint selection fixed.
+Do not launch the retained
+`configs/causal_forcing_dmd_chunkwise_long_ar_teacher_mem1_ungated.yaml` as the
+new result: it still represents the earlier 63-latent rolling sink/recent
+layout. The tuned-teacher DMD configuration will be aligned only after the
+20-second AR teacher checkpoint is selected. All later comparisons should keep
+the initial checkpoint, seed, global batch, prompt stream, frame count, and
+checkpoint selection fixed.
 
 ## Evaluation
 
@@ -337,7 +342,7 @@ old teacher; the tuned-teacher mem1 result is still pending.
 ```text
 LongVideo/
 ├── configs/                 training and experiment configurations
-├── data_manifests/          versioned UltraVideo-Long 5K selection
+├── data_manifests/          versioned UltraVideo-Long 5K-20s selection
 ├── docs/                    handoff and reproduction documentation
 ├── model/                   DMD and diffusion objectives
 ├── pipeline/                training and inference pipelines
@@ -372,17 +377,33 @@ launch scripts read W&B authentication from `WANDB_API_KEY`.
 The current 20-second data path was debugged on real UltraVideo-Long clips and
 an NVIDIA RTX PRO 6000 Blackwell GPU:
 
-- every eligible clip decoded from a deterministic random 321-frame crop;
+- four clips from the locked 5K-20s selection decoded from deterministic random
+  321-frame crops, with no duration skips;
 - exact smoke latent shape `(81, 16, 30, 52)`, FP16, all finite;
 - rerunning validated and skipped the existing shards;
 - a changed encode plan and an intentionally partial shard set were rejected;
-- the strict LMDB builder and full end-to-end data audit passed.
+- the strict LMDB builder and full end-to-end data audit passed;
+- two complete half-resolution forward/backward, gradient-clipping and AdamW
+  update steps ran on one GPU without OOM;
+- checkpoints were saved at steps 1 and 2; the final checkpoint retained all
+  825 base-model keys, all 825 tensors changed, and every tensor remained finite;
+- an additional one-step run used the production latent shape
+  `(81, 16, 60, 104)` on one 96GB GPU, peaked at approximately 78.8GB, saved a
+  5.3GB checkpoint and passed the same 825-key finite-weight audit.
+
+At production resolution, eager `create_block_mask` attempted to materialize a
+token-level boolean mask and requested roughly 248GB. The sparse teacher path
+now compiles block-mask construction, so mask evaluation is fused with block
+reduction and only FlexAttention `BlockMask` metadata is retained. The
+production launcher also keeps `max-autotune-no-cudagraphs`, allowing Blackwell
+to reject over-sized Triton schedules and select a valid kernel. This follows
+[PyTorch's guidance for reducing `create_block_mask` peak memory](https://pytorch.org/blog/flexattention/#faq).
 
 This validates video seeking, latent generation, resumability, completion
-contracts and LMDB integrity. It does not claim that a full 5K run has
-completed, that the two-node collective path has already been exercised end to
-end, or that the tuned-teacher mem1 quality result is known. Those are the next
-production experiments.
+contracts, LMDB integrity and the complete one-GPU training/checkpoint path. It
+does not claim that a full 5K run has completed, that the two-node collective
+path has already been exercised end to end, or that the tuned-teacher mem1
+quality result is known. Those are the next production experiments.
 
 ## Acknowledgements
 

@@ -34,7 +34,7 @@ cd "$BASE"
   --videos-dir dataset/UltraVideo-Long-debug/videos \
   --latents-dir dataset/UltraVideo-Long-debug/latents_81_240x416 \
   --lmdb dataset/UltraVideo-Long-debug/clean_data_81_240x416 \
-  --expected-count 3 \
+  --expected-count 4 \
   --latent-shape 81 16 30 52
 "$PYTHON" -m torch.distributed.run \
   --nproc_per_node=1 \

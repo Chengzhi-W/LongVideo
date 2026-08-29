@@ -56,7 +56,7 @@ case "$ACTION" in
       --videos-dir "$ROOT/dataset/UltraVideo-Long-debug/videos"
       --latents-dir "$ROOT/dataset/UltraVideo-Long-debug/latents_81_240x416"
       --lmdb "$ROOT/dataset/UltraVideo-Long-debug/clean_data_81_240x416"
-      --expected-count 3
+      --expected-count 4
       --latent-shape 81 16 30 52
     )
     [[ "${FULL_AUDIT:-0}" == 1 ]] && audit_args+=(--full)

@@ -1050,7 +1050,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             H=None,
             Q_LEN=mask_length,
             KV_LEN=mask_length,
-            _compile=False,
+            # Eager create_block_mask first materializes the complete token-level
+            # boolean mask.  At 480x832, 117 frames contain 182,520 tokens, so
+            # that temporary is far larger than GPU memory.  Compiling fuses
+            # mask evaluation with block reduction and keeps only BlockMask
+            # metadata; the resulting attention semantics are unchanged.
+            _compile=True,
             device=device,
         )
 
