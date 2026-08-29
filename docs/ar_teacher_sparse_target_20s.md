@@ -74,4 +74,7 @@ python tools/audit_sparse_teacher_forcing_20s.py \
 ```
 
 Use `tools/run_ar_teacher_sparse12_20s_smoke_1gpu.sh` for the two-step GPU
-smoke test and `tools/run_ar_teacher_sparse12_20s_multinode.sh` for production.
+smoke test. Production uses `tools/run_ar_teacher_sparse12_20s.sh`: it defaults
+to one node with 8 GPUs (`full` FSDP, accumulation 2) and switches to two nodes
+with 8 GPUs each (`hybrid_full`, accumulation 1) when `NNODES=2`. Both execute
+one optimizer update per effective global batch of 16.

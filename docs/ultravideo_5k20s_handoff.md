@@ -79,13 +79,32 @@ ULTRAVIDEO_20S_DATA_AUDIT_OK:count=4900
 ## 5. Launch training
 
 The production launcher performs a fast sampled data audit again before any
-distributed model process starts:
+distributed model process starts. It supports exactly the two reviewed
+topologies below; both preserve effective global batch 16 and learning rate
+`2e-6`:
+
+| Hardware | Config selected automatically | FSDP | Accumulation |
+|---|---|---|---:|
+| 1 × 8 GPUs | `ar_teacher_ultravideo_long_5k_81f_sparse12_8gpu.yaml` | `full` | 2 |
+| 2 × 8 GPUs | `ar_teacher_ultravideo_long_5k_81f_sparse12.yaml` | `hybrid_full` | 1 |
+
+Single-node 8-GPU launch:
 
 ```bash
-NODE_RANK=... MASTER_ADDR=... \
-  PYTHON=/path/to/python \
-  bash tools/run_ar_teacher_sparse12_20s_multinode.sh
+PYTHON=/path/to/python bash tools/run_ar_teacher_sparse12_20s.sh
 ```
+
+Two-node 16-GPU launch (run on each node with `NODE_RANK=0` or `1`):
+
+```bash
+NNODES=2 NODE_RANK=... MASTER_ADDR=... \
+  PYTHON=/path/to/python \
+  bash tools/run_ar_teacher_sparse12_20s.sh
+```
+
+Set `DRY_RUN=1` on either command to validate topology, config, global batch,
+accumulation, sharding, and the sparse attention contract without requiring the
+dataset or checkpoint. Unsupported layouts fail before training starts.
 
 Never manually copy an LMDB from another run into this root. The encode-plan
 digest is carried into LMDB metadata specifically to detect that mistake.

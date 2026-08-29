@@ -13,10 +13,11 @@ wandb_host: https://api.wandb.ai
 wandb_entity: null
 wandb_project: long-video-ar-teacher-20s
 
-# Two 8-GPU machines, batch 1 per GPU. This trainer does not implement
-# gradient accumulation, so total_batch_size must equal the real world size.
+# Two 8-GPU machines, one micro-batch per GPU and one micro-step per update.
+# This matches the 8-GPU config's effective global batch of 16.
 sharding_strategy: hybrid_full
 batch_size: 1
+gradient_accumulation_steps: 1
 total_batch_size: 16
 num_workers: 4
 lr: 2.0e-06

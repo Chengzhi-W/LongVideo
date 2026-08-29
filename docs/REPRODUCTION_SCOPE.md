@@ -18,8 +18,11 @@ prefilled from six recent latents at absolute RoPE positions 12..17; it is not
 sliced from the full-history KV cache. Both branches predict the identical
 noisy current chunk at positions 18..20.
 
-The UltraVideo-Long scripts prepare either 21- or 63-latent clean data. The
-long AR-teacher configuration explicitly expands Wan's sequence capacity to 63
-latents and trains through the 63-latent teacher-forcing attention mask. A
-one-GPU, low-spatial-resolution smoke test must pass before the two-node run;
-only the production-resolution fine-tune should be used for DMD experiments.
+The current UltraVideo-Long AR-teacher path prepares 81-latent clean data from
+321 pixel frames. The long AR-teacher configuration expands Wan's sequence
+capacity to 81 latents and trains with the locked
+`sink3 + slow12 + fast3 + noisy-current3` attention contract. A one-GPU,
+low-spatial-resolution smoke test must pass before production. Production may
+use one node with 8 GPUs and accumulation 2, or two nodes with 8 GPUs each and
+accumulation 1; both keep effective global batch 16. Only the
+production-resolution fine-tune should be used for downstream DMD experiments.

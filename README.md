@@ -96,10 +96,11 @@ sink3 + slow sparse12 + fast recent3 + noisy current3 = 21 visible latents
 ```
 
 The clean 81-latent trajectory remains available as context. For efficiency,
-each optimizer step randomly selects 12 of its 27 three-latent chunks as noisy
-flow-matching targets. The transformer therefore processes 81 clean context
-latents plus 36 noisy target latents instead of duplicating all 81 targets.
-Every chunk is sampled equally often across a balanced nine-pattern bank.
+each training sample randomly selects 12 of its 27 three-latent chunks as noisy
+flow-matching targets. Its transformer sequence therefore contains 81 clean
+context latents plus 36 noisy target latents instead of duplicating all 81
+targets. Every chunk is sampled equally often across a balanced nine-pattern
+bank.
 
 Absolute RoPE positions remain on the full 81-latent timeline. There is no
 frequency decomposition, KV dropout, DMD loss, or random history removal in
@@ -206,10 +207,10 @@ commands below are the shortest safe path.
 
 The teacher is fine-tuned on an 81-latent timeline with the same bounded cache
 used at inference. Each mature three-latent target chunk sees a fixed 21-frame
-budget: `sink3 + slow12 + fast recent3 + noisy current3`. Every optimizer step
-randomly chooses one of nine balanced patterns and supervises 12 of the 27
-current chunks. Absolute RoPE positions are preserved across the full timeline;
-this is not full-history attention.
+budget: `sink3 + slow12 + fast recent3 + noisy current3`. Every micro-batch on
+each rank randomly chooses one of nine balanced patterns and supervises 12 of
+the 27 current chunks. Absolute RoPE positions are preserved across the full
+timeline; this is not full-history attention.
 
 Concretely, one training sample contains the full clean tensor
 `[81, 16, 60, 104]`. Twelve complete chunks (36 latent frames) are selected,
@@ -247,32 +248,60 @@ bash tools/ultravideo_long_5k.sh build-20s
 FULL_AUDIT=1 bash tools/ultravideo_long_5k.sh audit-20s
 ```
 
-### Two-node / 16-GPU training
+### 8-GPU or 16-GPU production training
 
 The production configuration is open-ended. It does **not** force a maximum
 step; checkpoints are written every 100 steps and the operator chooses when to
-stop. The locked topology is 2 nodes × 8 GPUs, batch 1 per GPU, global batch 16,
-seed 42.
+stop. Both supported topologies use batch 1 per GPU, effective global batch 16,
+learning rate `2e-6`, and seed 42:
+
+| Hardware | FSDP sharding | Micro-batches per update | Effective global batch |
+|---|---|---:|---:|
+| 1 node × 8 GPUs | `full` | 2 | 16 |
+| 2 nodes × 8 GPUs | `hybrid_full` | 1 | 16 |
+
+The canonical launcher selects the matching reviewed config. To verify a
+machine's topology and config without requiring data or model weights:
+
+```bash
+# Single-node contract (the default)
+DRY_RUN=1 bash tools/run_ar_teacher_sparse12_20s.sh
+
+# Two-node contract; run this check on either node with its own NODE_RANK
+DRY_RUN=1 NNODES=2 NODE_RANK=0 MASTER_ADDR=<node-0-ip> \
+  bash tools/run_ar_teacher_sparse12_20s.sh
+```
+
+For one 8-GPU machine:
+
+```bash
+export WANDB_API_KEY=<your-key>
+bash tools/run_ar_teacher_sparse12_20s.sh
+```
+
+For two 8-GPU machines, use the same command on both nodes:
 
 ```bash
 export WANDB_API_KEY=<your-key>
 
 # Node 0
-NODE_RANK=0 MASTER_ADDR=<node-0-ip> \
-  bash tools/run_ar_teacher_sparse12_20s_multinode.sh
+NNODES=2 NODE_RANK=0 MASTER_ADDR=<node-0-ip> \
+  bash tools/run_ar_teacher_sparse12_20s.sh
 
 # Node 1
-NODE_RANK=1 MASTER_ADDR=<node-0-ip> \
-  bash tools/run_ar_teacher_sparse12_20s_multinode.sh
+NNODES=2 NODE_RANK=1 MASTER_ADDR=<node-0-ip> \
+  bash tools/run_ar_teacher_sparse12_20s.sh
 ```
 
 The launcher resolves the repository root automatically, so the clone may be
 placed anywhere as long as checkpoints and LMDB use the documented relative
-paths. The AR trainer does not implement gradient accumulation. The launcher
-therefore rejects a world-size/global-batch mismatch before loading model
-weights. An 8-GPU run needs an explicitly reviewed config with global batch 8
-(or a separately validated per-GPU batch 2); it is not the same locked protocol
-as the 16-GPU run.
+paths. On 8 GPUs the trainer accumulates two micro-batches and suppresses the
+first FSDP gradient synchronization; it clips gradients and calls the optimizer
+only after the second micro-batch. On 16 GPUs it updates after one micro-batch.
+The launcher rejects an unsupported topology, wrong sharding strategy,
+accumulation mismatch, or world-size/global-batch mismatch before loading model
+weights. The old `run_ar_teacher_sparse12_20s_multinode.sh` name remains only as
+a compatibility wrapper for the 16-GPU command.
 
 ## Memory-DMD experiments
 
@@ -383,8 +412,9 @@ an NVIDIA RTX PRO 6000 Blackwell GPU:
 - rerunning validated and skipped the existing shards;
 - a changed encode plan and an intentionally partial shard set were rejected;
 - the strict LMDB builder and full end-to-end data audit passed;
-- two complete half-resolution forward/backward, gradient-clipping and AdamW
-  update steps ran on one GPU without OOM;
+- the half-resolution smoke was repeated with gradient accumulation 2: four
+  complete micro-batch forward/backward passes produced exactly two
+  gradient-clipping and AdamW update steps without OOM;
 - checkpoints were saved at steps 1 and 2; the final checkpoint retained all
   825 base-model keys, all 825 tensors changed, and every tensor remained finite;
 - an additional one-step run used the production latent shape
@@ -401,9 +431,11 @@ to reject over-sized Triton schedules and select a valid kernel. This follows
 
 This validates video seeking, latent generation, resumability, completion
 contracts, LMDB integrity and the complete one-GPU training/checkpoint path. It
-does not claim that a full 5K run has completed, that the two-node collective
-path has already been exercised end to end, or that the tuned-teacher mem1
-quality result is known. Those are the next production experiments.
+also validates both 8- and 16-GPU launcher contracts before process creation.
+It does not claim that a full 5K run has completed, that either multi-GPU
+collective path has already been exercised end to end, or that the
+tuned-teacher mem1 quality result is known. Those are the next production
+experiments.
 
 ## Acknowledgements
 

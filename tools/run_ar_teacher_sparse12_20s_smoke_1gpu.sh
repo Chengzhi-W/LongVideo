@@ -60,6 +60,15 @@ grep -q 'Reached max_steps=2' "$LOGDIR/train.log" || {
   echo "SMOKE_DID_NOT_REACH_MAX_STEPS" >&2
   exit 1
 }
+grep -q 'AR TEACHER BATCH CONTRACT world_size=1 micro_batch=1 gradient_accumulation=2 global_batch=2' \
+  "$LOGDIR/train.log" || {
+  echo "SMOKE_GRADIENT_ACCUMULATION_CONTRACT_MISSING" >&2
+  exit 1
+}
+[[ "$(grep -c 'AR_TEACHER_TRAIN_STEP:.*micro_batches=2' "$LOGDIR/train.log")" == "2" ]] || {
+  echo "SMOKE_GRADIENT_ACCUMULATION_STEPS_MISSING" >&2
+  exit 1
+}
 "$PYTHON" tools/audit_ar_teacher_checkpoint.py \
   --base "$BASE/checkpoints/chunkwise/ar_diffusion.pt" \
   --tuned "$LOGDIR/checkpoint_model_000002/model.pt"
