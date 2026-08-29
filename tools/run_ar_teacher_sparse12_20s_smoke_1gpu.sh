@@ -16,6 +16,7 @@ export WAN_FLEX_COMPILE_MODE="${WAN_FLEX_COMPILE_MODE:-max-autotune-no-cudagraph
 for path in \
   "$CONFIG" \
   "$BASE/checkpoints/chunkwise/ar_diffusion.pt" \
+  "$BASE/dataset/UltraVideo-Long-debug/latents_81_240x416/_ENCODE_COMPLETE.json" \
   "$BASE/dataset/UltraVideo-Long-debug/clean_data_81_240x416"; do
   [[ -e "$path" ]] || { echo "MISSING_REQUIRED_PATH:$path" >&2; exit 1; }
 done
@@ -28,6 +29,13 @@ mkdir -p "$LOGDIR"
 
 cd "$BASE"
 "$PYTHON" tools/audit_sparse_teacher_forcing_20s.py --config "$CONFIG"
+"$PYTHON" tools/audit_ultravideo_long_20s_data.py \
+  --manifest dataset/UltraVideo-Long-debug/manifests/train.csv \
+  --videos-dir dataset/UltraVideo-Long-debug/videos \
+  --latents-dir dataset/UltraVideo-Long-debug/latents_81_240x416 \
+  --lmdb dataset/UltraVideo-Long-debug/clean_data_81_240x416 \
+  --expected-count 3 \
+  --latent-shape 81 16 30 52
 "$PYTHON" -m torch.distributed.run \
   --nproc_per_node=1 \
   --nnodes=1 \

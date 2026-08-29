@@ -110,19 +110,19 @@ mixture of three changes.
 ### 4. End-to-end pipeline
 
 The repository provides an end-to-end pipeline for fine-tuning the AR teacher on
-15-second UltraVideo-Long clips:
+20-second UltraVideo-Long clips:
 
 ```mermaid
 flowchart LR
     A["UltraVideo-Long metadata"] --> B["Locked 5K selection"]
     B --> C["Resumable video download"]
-    C --> D["249 frames · 16 fps"]
-    D --> E["Wan VAE · 63 latents"]
+    C --> D["321 frames · 16 fps"]
+    D --> E["Wan VAE · 81 latents"]
     E --> F["Atomic latent shards"]
     F --> G["LMDB"]
     G --> H["Long-history AR teacher fine-tuning"]
     H --> I["Memory-DMD experiments"]
-    I --> J["15 s VBench"]
+    I --> J["Long-video evaluation"]
 ```
 
 ## Project status
@@ -130,7 +130,7 @@ flowchart LR
 - [x] Reproduce senior baseline and `mem1_nonorm` training protocols.
 - [x] Implement A18−A6 with absolute RoPE alignment and clean local prefill.
 - [x] Support joint normalization and optional `t < 750` gating.
-- [x] Lock 15-second generation to 63 latent / 249 pixel frames at 16 fps.
+- [x] Lock AR-teacher fine-tuning to 81 latent / 321 pixel frames at 16 fps.
 - [x] Build official-prompt VBench evaluation for seven quality dimensions.
 - [x] Build deterministic UltraVideo-Long 5K download and preprocessing.
 - [x] Pass a real-data, one-GPU, two-step AR-teacher smoke test.
@@ -212,16 +212,17 @@ attention.
 
 ### One-GPU preflight
 
-The smoke test keeps all 63 latent frames while reducing spatial resolution.
+The smoke test keeps all 81 latent frames while reducing spatial resolution.
 It validates real video decoding, VAE encoding, LMDB loading, model loading,
 the exact sink/recent attention topology, forward/backward, optimizer updates,
 and checkpoint serialization.
 
 ```bash
 DEBUG_COUNT=4 bash tools/ultravideo_long_5k.sh debug-download
-bash tools/ultravideo_long_5k.sh debug-encode
-bash tools/ultravideo_long_5k.sh debug-build
-bash tools/run_ar_teacher_ultravideo_long_smoke_1gpu.sh
+bash tools/ultravideo_long_5k.sh debug-encode-20s
+bash tools/ultravideo_long_5k.sh debug-build-20s
+FULL_AUDIT=1 bash tools/ultravideo_long_5k.sh debug-audit-20s
+bash tools/run_ar_teacher_sparse12_20s_smoke_1gpu.sh
 ```
 
 ### Full 5K preparation
@@ -231,9 +232,11 @@ bash tools/run_ar_teacher_ultravideo_long_smoke_1gpu.sh
 bash tools/ultravideo_long_5k.sh metadata
 bash tools/ultravideo_long_5k.sh download
 
-# 249 pixel frames -> 63 Wan latents, then atomic LMDB packing.
-NPROC_PER_NODE=8 bash tools/ultravideo_long_5k.sh encode-long
-bash tools/ultravideo_long_5k.sh build-long
+# Validate all videos, then encode 321 pixel frames -> 81 Wan latents.
+bash tools/ultravideo_long_5k.sh check-20s
+NPROC_PER_NODE=8 bash tools/ultravideo_long_5k.sh encode-20s
+bash tools/ultravideo_long_5k.sh build-20s
+FULL_AUDIT=1 bash tools/ultravideo_long_5k.sh audit-20s
 ```
 
 ### Two-node / 16-GPU training
@@ -248,11 +251,11 @@ export WANDB_API_KEY=<your-key>
 
 # Node 0
 NODE_RANK=0 MASTER_ADDR=<node-0-ip> \
-  bash tools/run_ar_teacher_ultravideo_long_2k_multinode.sh
+  bash tools/run_ar_teacher_sparse12_20s_multinode.sh
 
 # Node 1
 NODE_RANK=1 MASTER_ADDR=<node-0-ip> \
-  bash tools/run_ar_teacher_ultravideo_long_2k_multinode.sh
+  bash tools/run_ar_teacher_sparse12_20s_multinode.sh
 ```
 
 The launcher resolves the repository root automatically, so the clone may be
@@ -366,25 +369,20 @@ launch scripts read W&B authentication from `WANDB_API_KEY`.
 
 ## Validated handoff
 
-The AR-teacher path was debugged on four real UltraVideo-Long clips and an
-NVIDIA RTX PRO 6000 Blackwell GPU:
+The current 20-second data path was debugged on real UltraVideo-Long clips and
+an NVIDIA RTX PRO 6000 Blackwell GPU:
 
-- four videos fully decoded, each longer than 15.6 seconds;
-- exact smoke latent shape `(63, 16, 30, 52)`, FP16, all finite;
-- four LMDB rows loaded with non-empty prompts;
-- two complete 63-latent forward/backward optimizer steps;
-- step-2 checkpoint matched all 825 initial model keys;
-- all 825 tensors changed and remained finite after optimization.
+- every eligible clip decoded from a deterministic random 321-frame crop;
+- exact smoke latent shape `(81, 16, 30, 52)`, FP16, all finite;
+- rerunning validated and skipped the existing shards;
+- a changed encode plan and an intentionally partial shard set were rejected;
+- the strict LMDB builder and full end-to-end data audit passed.
 
-On Blackwell, the fixed FlexAttention Triton schedule exceeded per-block shared
-resources. The handoff launchers therefore default to
-`max-autotune-no-cudagraphs`, which selected valid equivalent forward and
-backward kernels.
-
-This validates the one-GPU code path and checkpoint format. It does not claim
-that a full 5K/2K-step run has completed, that the two-node collective path has
-already been exercised end to end, or that the tuned-teacher mem1 quality result
-is known. Those are the next production experiments.
+This validates video seeking, latent generation, resumability, completion
+contracts and LMDB integrity. It does not claim that a full 5K run has
+completed, that the two-node collective path has already been exercised end to
+end, or that the tuned-teacher mem1 quality result is known. Those are the next
+production experiments.
 
 ## Acknowledgements
 

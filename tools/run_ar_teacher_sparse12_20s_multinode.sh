@@ -21,7 +21,9 @@ export WAN_FLEX_COMPILE_MODE="${WAN_FLEX_COMPILE_MODE:-max-autotune-no-cudagraph
 for path in \
   "$CONFIG" \
   "$BASE/checkpoints/chunkwise/ar_diffusion.pt" \
-  "$BASE/dataset/UltraVideo-Long-5K/clean_data_81"; do
+  "$BASE/dataset/UltraVideo-Long-5K-20s/manifests/train.csv" \
+  "$BASE/dataset/UltraVideo-Long-5K-20s/latents_81/_ENCODE_COMPLETE.json" \
+  "$BASE/dataset/UltraVideo-Long-5K-20s/clean_data_81"; do
   [[ -e "$path" ]] || { echo "MISSING_REQUIRED_PATH:$path" >&2; exit 1; }
 done
 
@@ -33,6 +35,12 @@ mkdir -p "$LOGDIR/wandb"
 
 cd "$BASE"
 "$PYTHON" tools/audit_sparse_teacher_forcing_20s.py --config "$CONFIG"
+"$PYTHON" tools/audit_ultravideo_long_20s_data.py \
+  --manifest dataset/UltraVideo-Long-5K-20s/manifests/train.csv \
+  --latents-dir dataset/UltraVideo-Long-5K-20s/latents_81 \
+  --lmdb dataset/UltraVideo-Long-5K-20s/clean_data_81 \
+  --expected-count 4900 \
+  --latent-shape 81 16 60 104
 "$PYTHON" - "$CONFIG" "$NNODES" "$NPROC_PER_NODE" <<'PY'
 import sys
 from omegaconf import OmegaConf

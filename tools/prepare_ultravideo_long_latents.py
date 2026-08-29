@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -21,6 +22,10 @@ from typing import Iterable
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+ENCODE_PLAN_NAME = "_ENCODE_PLAN.json"
+ENCODE_COMPLETE_NAME = "_ENCODE_COMPLETE.json"
+ENCODE_SCHEMA_VERSION = 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,6 +109,77 @@ def output_name(index: int, clip_id: str) -> str:
     return f"{index:06d}_{safe}.pt"
 
 
+def sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def atomic_json_write(destination: Path, payload: dict) -> None:
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, destination)
+
+
+def build_encode_plan(args: argparse.Namespace, rows: list[dict[str, str]]) -> dict:
+    samples = []
+    for index, row in enumerate(rows):
+        prompt = row[args.caption_field].strip()
+        samples.append(
+            {
+                "clip_id": row["clip_id"],
+                "duration_seconds": row.get("duration", "").strip(),
+                "filename": output_name(index, row["clip_id"]),
+                "prompt_sha256": sha256_text(prompt),
+                "source_video": Path(row["local_path"]).name,
+            }
+        )
+
+    payload = {
+        "schema_version": ENCODE_SCHEMA_VERSION,
+        "source": "APRIL-AIGC/UltraVideo-Long",
+        "manifest_sha256": hashlib.sha256(args.manifest.resolve().read_bytes()).hexdigest(),
+        "split": args.split,
+        "caption_field": args.caption_field,
+        "count": len(samples),
+        "preprocess": {
+            "seed": args.seed,
+            "pixel_frames": args.num_frames,
+            "latent_frames": (args.num_frames - 1) // 4 + 1,
+            "fps": args.fps,
+            "height": args.height,
+            "width": args.width,
+        },
+        "latent_shape": [
+            (args.num_frames - 1) // 4 + 1,
+            16,
+            args.height // 8,
+            args.width // 8,
+        ],
+        "samples": samples,
+    }
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    payload["plan_sha256"] = hashlib.sha256(canonical).hexdigest()
+    return payload
+
+
+def ensure_encode_plan(output_dir: Path, plan: dict) -> None:
+    destination = output_dir / ENCODE_PLAN_NAME
+    if destination.exists():
+        current = json.loads(destination.read_text(encoding="utf-8"))
+        if current != plan:
+            raise RuntimeError(
+                f"Encoding settings do not match existing {destination}. "
+                "Use the original arguments or a new --output-dir."
+            )
+        return
+    atomic_json_write(destination, plan)
+
+
 def probe_duration_seconds(container, stream) -> float:
     if stream.duration is not None and stream.time_base is not None:
         return float(stream.duration * stream.time_base)
@@ -154,11 +230,23 @@ def decode_window(
         slack = max(0.0, duration - window_seconds - 1.0 / fps)
         start = stable_fraction(seed, clip_id) * slack
         target_times = [start + index / fps for index in range(num_frames)]
+
+        # Long clips can be tens of minutes. Seek to a keyframe shortly before
+        # the deterministic crop instead of decoding from the beginning.
+        if start > 0 and stream.time_base is not None:
+            seek_seconds = max(0.0, start - 2.0)
+            seek_timestamp = int(seek_seconds / float(stream.time_base))
+            container.seek(
+                seek_timestamp, stream=stream, any_frame=False, backward=True
+            )
+
         selected = []
         next_index = 0
         last_rgb = None
         for frame in container.decode(stream):
             if frame.time is None:
+                continue
+            if frame.time + 1e-6 < target_times[next_index]:
                 continue
             rgb = frame.to_ndarray(format="rgb24")
             last_rgb = rgb
@@ -190,10 +278,81 @@ def atomic_torch_save(torch, payload: dict, destination: Path) -> None:
     os.replace(temporary, destination)
 
 
+def validate_existing_shard(
+    torch,
+    destination: Path,
+    *,
+    row: dict[str, str],
+    args: argparse.Namespace,
+    expected_shape: tuple[int, int, int, int],
+) -> None:
+    try:
+        item = torch.load(destination, map_location="cpu", weights_only=False)
+        latent = item["latent"]
+        preprocess = item["preprocess"]
+    except Exception as exc:
+        raise RuntimeError(
+            f"Existing shard is unreadable: {destination}. Move it aside and rerun."
+        ) from exc
+
+    expected_metadata = {
+        "clip_id": row["clip_id"],
+        "prompt": row[args.caption_field].strip(),
+        "source_video": Path(row["local_path"]).name,
+    }
+    actual_metadata = {key: item.get(key) for key in expected_metadata}
+    if actual_metadata != expected_metadata:
+        raise RuntimeError(
+            f"Existing shard metadata mismatch: {destination}: "
+            f"expected={expected_metadata}, actual={actual_metadata}"
+        )
+    expected_preprocess = {
+        "seed": args.seed,
+        "pixel_frames": args.num_frames,
+        "fps": args.fps,
+        "height": args.height,
+        "width": args.width,
+    }
+    for key, expected in expected_preprocess.items():
+        if preprocess.get(key) != expected:
+            raise RuntimeError(
+                f"Existing shard preprocess mismatch for {destination}: "
+                f"{key}={preprocess.get(key)!r}, expected {expected!r}"
+            )
+    if not torch.is_tensor(latent) or tuple(latent.shape) != expected_shape:
+        raise RuntimeError(
+            f"Existing shard shape mismatch for {destination}: "
+            f"{getattr(latent, 'shape', None)} != {expected_shape}"
+        )
+    if latent.dtype != torch.float16 or not bool(torch.isfinite(latent).all()):
+        raise RuntimeError(
+            f"Existing shard must be finite float16: {destination}, dtype={latent.dtype}"
+        )
+
+
+def validate_completed_file_set(output_dir: Path, plan: dict) -> None:
+    expected = {sample["filename"] for sample in plan["samples"]}
+    actual = {path.name for path in output_dir.glob("*.pt")}
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Encoded shard set is incomplete or contaminated: "
+            f"missing={missing[:8]} ({len(missing)} total), "
+            f"unexpected={unexpected[:8]} ({len(unexpected)} total)"
+        )
+
+
 def main() -> int:
     args = parse_args()
     if args.num_frames < 1 or (args.num_frames - 1) % 4 != 0:
-        raise ValueError("--num-frames must have the form 4k+1 (for example 81 or 249)")
+        raise ValueError(
+            "--num-frames must have the form 4k+1 (for example 81, 249 or 321)"
+        )
+    if args.fps <= 0 or args.height <= 0 or args.width <= 0:
+        raise ValueError("--fps, --height and --width must be positive")
+    if args.limit < 0:
+        raise ValueError("--limit must be non-negative")
     if args.height % 16 or args.width % 16:
         raise ValueError("--height and --width must be divisible by 16")
 
@@ -214,6 +373,8 @@ def main() -> int:
             f"shorter than {window_seconds:.3f}s")
     if args.limit:
         rows = rows[: args.limit]
+    if not rows:
+        raise RuntimeError("No manifest rows remain after split/duration filtering")
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -238,15 +399,34 @@ def main() -> int:
     if not torch.cuda.is_available():
         raise RuntimeError("Wan VAE encoding requires a CUDA GPU")
     torch.cuda.set_device(local_rank)
+    distributed = world_size > 1
+    if distributed:
+        torch.distributed.init_process_group(backend="gloo", init_method="env://")
+
+    plan = build_encode_plan(args, rows)
+    if rank == 0:
+        ensure_encode_plan(args.output_dir, plan)
+    if distributed:
+        torch.distributed.barrier()
+    ensure_encode_plan(args.output_dir, plan)
+
     from utils.wan_wrapper import WanVAEWrapper
 
     device = torch.device("cuda", local_rank)
     vae = WanVAEWrapper().to(device)
     completed = 0
+    expected_shape = tuple(plan["latent_shape"])
     for index, row in assigned:
         clip_id = row["clip_id"]
         destination = args.output_dir / output_name(index, clip_id)
         if destination.is_file() and destination.stat().st_size > 0:
+            validate_existing_shard(
+                torch,
+                destination,
+                row=row,
+                args=args,
+                expected_shape=expected_shape,
+            )
             completed += 1
             continue
         video_path = resolve_video(args.videos_dir.resolve(), row)
@@ -262,8 +442,7 @@ def main() -> int:
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
             latent = vae.encode_to_latent(pixel.unsqueeze(0).to(device))[0]
         latent = latent.to(device="cpu", dtype=torch.float16).contiguous()
-        expected_latents = (args.num_frames - 1) // 4 + 1
-        if tuple(latent.shape) != (expected_latents, 16, args.height // 8, args.width // 8):
+        if tuple(latent.shape) != expected_shape:
             raise RuntimeError(f"Unexpected latent shape for {clip_id}: {tuple(latent.shape)}")
         atomic_torch_save(
             torch,
@@ -286,6 +465,30 @@ def main() -> int:
         )
         completed += 1
         print(f"[rank {rank}] {completed}/{len(assigned)} {clip_id} -> {destination.name}")
+
+    if distributed:
+        torch.distributed.barrier()
+    if rank == 0:
+        validate_completed_file_set(args.output_dir, plan)
+        atomic_json_write(
+            args.output_dir / ENCODE_COMPLETE_NAME,
+            {
+                "schema_version": ENCODE_SCHEMA_VERSION,
+                "complete": True,
+                "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+                "count": plan["count"],
+                "latent_shape": plan["latent_shape"],
+                "plan_sha256": plan["plan_sha256"],
+                "plan_file": ENCODE_PLAN_NAME,
+            },
+        )
+        print(
+            f"[encode manifest] {plan['count']} verified shards; "
+            f"plan_sha256={plan['plan_sha256']}"
+        )
+    if distributed:
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
     print(f"[rank {rank}] COMPLETE ({completed} shards)")
     return 0
 

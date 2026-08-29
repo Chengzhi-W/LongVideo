@@ -59,4 +59,4 @@ model_kwargs:
   max_num_frames: 81
   frame_seq_length: 1560
 
-data_path: dataset/UltraVideo-Long-5K/clean_data_81
+data_path: dataset/UltraVideo-Long-5K-20s/clean_data_81

@@ -44,8 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("dataset/UltraVideo-Long-5K"),
-        help="Dataset output directory (default: dataset/UltraVideo-Long-5K).",
+        default=Path("dataset/UltraVideo-Long-5K-20s"),
+        help="Dataset output directory (default: dataset/UltraVideo-Long-5K-20s).",
     )
     parser.add_argument("--count", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=42)
@@ -66,10 +66,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-duration",
         type=float,
-        default=15.6,
+        default=20.0,
         help=(
-            "Only sample clips at least this many seconds long. The 15.6s default "
-            "supports a full 249-frame/16fps crop. Set 5.1 for 81-frame training."
+            "Only sample clips at least this many seconds long. The 20s default "
+            "supports a full 321-frame/16fps crop for 81-latent training."
         ),
     )
     parser.add_argument(
@@ -82,6 +82,10 @@ def parse_args() -> argparse.Namespace:
         "--metadata-only",
         action="store_true",
         help="Download metadata and create manifests, but do not download video ZIPs.",
+    )
+    parser.add_argument(
+        "--metadata-sha256",
+        help="Optional expected SHA-256 for official long.csv metadata.",
     )
     parser.add_argument(
         "--keep-archives",
@@ -399,6 +403,7 @@ def ensure_selection_state(
     resolution: str,
     min_duration: float,
     digest: str,
+    metadata_sha256: str | None,
 ) -> None:
     desired = {
         "count": count,
@@ -408,6 +413,8 @@ def ensure_selection_state(
         "selection_sha256": digest,
         "source": REPO_ID,
     }
+    if metadata_sha256:
+        desired["metadata_sha256"] = metadata_sha256
     if state_path.exists():
         current = json.loads(state_path.read_text(encoding="utf-8"))
         if current != desired:
@@ -513,6 +520,15 @@ def main() -> int:
             timeout=args.timeout,
         )
 
+    if args.metadata_sha256:
+        actual_metadata_sha256 = sha256_file(metadata_dir / "long.csv")
+        if actual_metadata_sha256 != args.metadata_sha256:
+            raise RuntimeError(
+                "Official long.csv SHA-256 mismatch: "
+                f"{actual_metadata_sha256} != {args.metadata_sha256}"
+            )
+        print(f"[metadata sha256 ok] {actual_metadata_sha256}")
+
     rows, original_fields = load_rows(metadata_dir / "long.csv")
     if args.selection_ids:
         selected = load_locked_selection(
@@ -539,6 +555,7 @@ def main() -> int:
         resolution=args.resolution,
         min_duration=args.min_duration,
         digest=digest,
+        metadata_sha256=args.metadata_sha256,
     )
     write_manifests(selected, original_fields, manifest_dir)
     print(
@@ -635,6 +652,7 @@ def main() -> int:
             "seed": args.seed,
             "min_duration": args.min_duration,
             "selection_sha256": digest,
+            "metadata_sha256": args.metadata_sha256,
             "videos_dir": "videos",
             "manifest": "manifests/ultravideo_long_5k.csv",
         },

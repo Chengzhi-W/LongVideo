@@ -40,6 +40,10 @@ FlexAttention masks compiled by each rank.
 
 ## Data and launch
 
+The production dataset uses the locked 5K-20s selection under
+`dataset/UltraVideo-Long-5K-20s` (4,900 train / 100 validation). Follow
+`docs/ultravideo_5k20s_handoff.md` for the complete resumable workflow.
+
 Prepare 20-second latents from 321 pixel frames at 16 fps:
 
 ```bash
@@ -47,7 +51,7 @@ python -m torch.distributed.run --nproc_per_node=8 \
   tools/prepare_ultravideo_long_latents.py \
   --manifest DATASET_MANIFEST.csv \
   --videos-dir DATASET_VIDEOS \
-  --output-dir dataset/UltraVideo-Long-5K/latents_81 \
+  --output-dir dataset/UltraVideo-Long-5K-20s/latents_81 \
   --num-frames 321 --fps 16 --height 480 --width 832 \
   --skip-too-short
 ```
@@ -56,8 +60,9 @@ Build the LMDB:
 
 ```bash
 python tools/build_ultravideo_long_lmdb.py \
-  --latents-dir dataset/UltraVideo-Long-5K/latents_81 \
-  --output dataset/UltraVideo-Long-5K/clean_data_81
+  --latents-dir dataset/UltraVideo-Long-5K-20s/latents_81 \
+  --output dataset/UltraVideo-Long-5K-20s/clean_data_81 \
+  --map-size-gb 128 --require-complete
 ```
 
 The same two operations are available as `encode-20s` and `build-20s` in

@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--count", type=int, default=4)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--resolution", choices=("960", "1920"), default="960")
-    parser.add_argument("--min-duration", type=float, default=15.6)
+    parser.add_argument("--min-duration", type=float, default=20.0)
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--retries", type=int, default=12)
     parser.add_argument("--initial-buffer-mb", type=int, default=8)
