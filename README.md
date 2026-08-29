@@ -17,7 +17,7 @@ It includes 15-second inference and locked VBench reproduction tools.
 
 [Method](#method) · [Quick start](#quick-start) · [AR teacher](#long-history-ar-teacher) ·
 [DMD experiments](#memory-dmd-experiments) · [Evaluation](#evaluation) ·
-[Full handoff guide](docs/ULTRAVIDEO_LONG_5K.md)
+[Full handoff guide](docs/ultravideo_5k20s_handoff.md)
 
 </div>
 
@@ -200,15 +200,15 @@ a missing setup step.
 ## Long-history AR teacher
 
 The full operator guide is
-[`docs/ULTRAVIDEO_LONG_5K.md`](docs/ULTRAVIDEO_LONG_5K.md). The commands below
-are the shortest safe path.
+[`docs/ultravideo_5k20s_handoff.md`](docs/ultravideo_5k20s_handoff.md). The
+commands below are the shortest safe path.
 
-The teacher is fine-tuned on a 63-latent timeline with the same bounded cache
-used at inference. Each mature three-latent target chunk attends to the first
-three latent frames (the attention sink), the immediately preceding 15 latent
-frames, and its own three noisy frames: `sink3 + recent15 + current3`. Absolute
-RoPE positions are preserved across the full timeline; this is not full-history
-attention.
+The teacher is fine-tuned on an 81-latent timeline with the same bounded cache
+used at inference. Each mature three-latent target chunk sees a fixed 21-frame
+budget: `sink3 + slow12 + fast recent3 + noisy current3`. Every optimizer step
+randomly chooses one of nine balanced patterns and supervises 12 of the 27
+current chunks. Absolute RoPE positions are preserved across the full timeline;
+this is not full-history attention.
 
 ### One-GPU preflight
 
