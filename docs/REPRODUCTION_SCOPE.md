@@ -23,6 +23,6 @@ The current UltraVideo-Long AR-teacher path prepares 81-latent clean data from
 capacity to 81 latents and trains with the locked
 `sink3 + slow12 + fast3 + noisy-current3` attention contract. A one-GPU,
 low-spatial-resolution smoke test must pass before production. Production may
-use one node with 8 GPUs and accumulation 2, or two nodes with 8 GPUs each and
-accumulation 1; both keep effective global batch 16. Only the
+use one node with 8 GPUs (global batch 8), or two nodes with 8 GPUs each (global
+batch 16). Both use per-GPU batch 1 with no gradient accumulation. Only the
 production-resolution fine-tune should be used for downstream DMD experiments.

@@ -207,17 +207,17 @@ commands below are the shortest safe path.
 
 The teacher is fine-tuned on an 81-latent timeline with the same bounded cache
 used at inference. Each mature three-latent target chunk sees a fixed 21-frame
-budget: `sink3 + slow12 + fast recent3 + noisy current3`. Every micro-batch on
-each rank randomly chooses one of nine balanced patterns and supervises 12 of
-the 27 current chunks. Absolute RoPE positions are preserved across the full
-timeline; this is not full-history attention.
+budget: `sink3 + slow12 + fast recent3 + noisy current3`. Every sample on each
+rank randomly chooses one of nine balanced patterns and supervises 12 of the 27
+current chunks. Absolute RoPE positions are preserved across the full timeline;
+this is not full-history attention.
 
 Concretely, one training sample contains the full clean tensor
 `[81, 16, 60, 104]`. Twelve complete chunks (36 latent frames) are selected,
 noised at flow-matching timesteps, and appended as targets. The loss is computed
-only on those 36 targets. With the locked 16-GPU global batch, each optimizer
-step therefore supervises 192 target chunks. The nine-pattern bank keeps this
-sampling exactly balanced while bounding FlexAttention compilation variants.
+only on those 36 targets. Each optimizer step therefore supervises 96 target
+chunks on 8 GPUs or 192 on 16 GPUs. The nine-pattern bank keeps this sampling
+exactly balanced while bounding FlexAttention compilation variants.
 
 ### One-GPU preflight
 
@@ -252,13 +252,24 @@ FULL_AUDIT=1 bash tools/ultravideo_long_5k.sh audit-20s
 
 The production configuration is open-ended. It does **not** force a maximum
 step; checkpoints are written every 100 steps and the operator chooses when to
-stop. Both supported topologies use batch 1 per GPU, effective global batch 16,
+stop. Both supported topologies use batch 1 per GPU, no gradient accumulation,
 learning rate `2e-6`, and seed 42:
 
-| Hardware | FSDP sharding | Micro-batches per update | Effective global batch |
+| Hardware | FSDP sharding | Batches per update | Effective global batch |
 |---|---|---:|---:|
-| 1 node × 8 GPUs | `full` | 2 | 16 |
+| 1 node × 8 GPUs | `full` | 1 | 8 |
 | 2 nodes × 8 GPUs | `hybrid_full` | 1 | 16 |
+
+The 8-GPU batch semantics follow the released Context Forcing **teacher**
+[launcher](https://github.com/TIGER-AI-Lab/Context-Forcing/blob/6dd9d9a88332a7b3f5402476895b3871306bcf88/stable_video_infinity/svi_long_context.sh)
+and its [default accumulation setting](https://github.com/TIGER-AI-Lab/Context-Forcing/blob/6dd9d9a88332a7b3f5402476895b3871306bcf88/stable_video_infinity/train_svi_long_context.py#L138-L142):
+eight GPUs, per-GPU batch 1, and accumulation 1, giving effective batch 8. We
+borrow that batch/update convention, not its LoRA/ERFT objective; this stage
+remains normal flow-matching AR-teacher fine-tuning. Its separate Context DMD
+student stage uses accumulation 8 and global batch 64; that setting is not
+imported here. The 16-GPU entry is a higher-throughput variant, not an exact
+batch-size reproduction of the reported teacher run, and each step sees twice
+as many videos as the 8-GPU run.
 
 The canonical launcher selects the matching reviewed config. To verify a
 machine's topology and config without requiring data or model weights:
@@ -295,11 +306,9 @@ NNODES=2 NODE_RANK=1 MASTER_ADDR=<node-0-ip> \
 
 The launcher resolves the repository root automatically, so the clone may be
 placed anywhere as long as checkpoints and LMDB use the documented relative
-paths. On 8 GPUs the trainer accumulates two micro-batches and suppresses the
-first FSDP gradient synchronization; it clips gradients and calls the optimizer
-only after the second micro-batch. On 16 GPUs it updates after one micro-batch.
-The launcher rejects an unsupported topology, wrong sharding strategy,
-accumulation mismatch, or world-size/global-batch mismatch before loading model
+paths. Every rank performs one forward/backward pass per optimizer update. The
+launcher rejects an unsupported topology, wrong sharding strategy, any requested
+gradient accumulation, or world-size/global-batch mismatch before loading model
 weights. The old `run_ar_teacher_sparse12_20s_multinode.sh` name remains only as
 a compatibility wrapper for the 16-GPU command.
 
@@ -412,9 +421,8 @@ an NVIDIA RTX PRO 6000 Blackwell GPU:
 - rerunning validated and skipped the existing shards;
 - a changed encode plan and an intentionally partial shard set were rejected;
 - the strict LMDB builder and full end-to-end data audit passed;
-- the half-resolution smoke was repeated with gradient accumulation 2: four
-  complete micro-batch forward/backward passes produced exactly two
-  gradient-clipping and AdamW update steps without OOM;
+- two complete half-resolution forward/backward, gradient-clipping and AdamW
+  update steps ran on one GPU without OOM;
 - checkpoints were saved at steps 1 and 2; the final checkpoint retained all
   825 base-model keys, all 825 tensors changed, and every tensor remained finite;
 - an additional one-step run used the production latent shape

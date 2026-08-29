@@ -1,6 +1,5 @@
 import gc
 import logging
-from contextlib import nullcontext
 
 from model import CausalDiffusion
 from utils.dataset import cycle, LatentLMDBDataset
@@ -92,21 +91,13 @@ class Trainer:
         dataset = LatentLMDBDataset(config.data_path, max_pair=int(1e8))
 
         self.dataset = dataset
-        self.gradient_accumulation_steps = int(
-            getattr(config, "gradient_accumulation_steps", 1))
-        if self.gradient_accumulation_steps <= 0:
-            raise ValueError("gradient_accumulation_steps must be positive")
-        effective_global_batch = (
-            dist.get_world_size()
-            * int(config.batch_size)
-            * self.gradient_accumulation_steps
-        )
+        effective_global_batch = dist.get_world_size() * int(config.batch_size)
         configured_global_batch = int(getattr(config, "total_batch_size", effective_global_batch))
         if configured_global_batch != effective_global_batch:
             raise RuntimeError(
+                "This AR trainer does not use gradient accumulation: "
                 f"total_batch_size={configured_global_batch}, but world_size * "
-                "batch_size * gradient_accumulation_steps="
-                f"{effective_global_batch}. Make them equal."
+                f"batch_size={effective_global_batch}. Make them equal."
             )
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
@@ -119,13 +110,6 @@ class Trainer:
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
             print("DATASET LATENT SHAPE", dataset.latents_shape)
-            print(
-                "AR TEACHER BATCH CONTRACT "
-                f"world_size={dist.get_world_size()} "
-                f"micro_batch={int(config.batch_size)} "
-                f"gradient_accumulation={self.gradient_accumulation_steps} "
-                f"global_batch={effective_global_batch}"
-            )
         expected_shape = tuple(int(v) for v in config.image_or_video_shape[1:])
         actual_shape = tuple(int(v) for v in dataset.latents_shape[1:])
         if actual_shape != expected_shape:
@@ -223,92 +207,67 @@ class Trainer:
             print("Model saved to", os.path.join(self.output_path,
                   f"checkpoint_model_{self.step:06d}", "model.pt"))
 
-    def train_one_step(self, micro_batches):
+    def train_one_step(self, batch):
+        self.log_iters = 1
+
         if self.step % 20 == 0:
             torch.cuda.empty_cache()
 
-        if len(micro_batches) != self.gradient_accumulation_steps:
-            raise RuntimeError(
-                "micro-batch count does not match gradient accumulation: "
-                f"{len(micro_batches)} != {self.gradient_accumulation_steps}"
-            )
-        self.generator_optimizer.zero_grad(set_to_none=True)
-        accumulated_loss = torch.zeros((), device=self.device, dtype=torch.float32)
-
-        for micro_index, batch in enumerate(micro_batches):
-            text_prompts = batch["prompts"]
-            if not self.config.load_raw_video:  # precomputed latent
-                clean_latent = batch["clean_latent"].to(
-                    device=self.device, dtype=self.dtype)
-            else:  # encode raw video to latent
-                frames = batch["frames"].to(
-                    device=self.device, dtype=self.dtype)
-
-                with torch.no_grad():
-                    clean_latent = self.model.vae.encode_to_latent(
-                        frames).to(device=self.device, dtype=self.dtype)
-            image_latent = clean_latent[:, 0:1, ]
-
-            batch_size = len(text_prompts)
-            image_or_video_shape = list(self.config.image_or_video_shape)
-            image_or_video_shape[0] = batch_size
+        # Step 1: Get the next batch of text prompts
+        text_prompts = batch["prompts"]
+        if not self.config.load_raw_video:  # precomputed latent
+            clean_latent = batch["clean_latent"].to(
+                device=self.device, dtype=self.dtype)
+        else:  # encode raw video to latent
+            frames = batch["frames"].to(
+                device=self.device, dtype=self.dtype)
 
             with torch.no_grad():
-                conditional_dict = self.model.text_encoder(
-                    text_prompts=text_prompts)
-                if not getattr(self, "unconditional_dict", None):
-                    unconditional_dict = self.model.text_encoder(
-                        text_prompts=[self.config.negative_prompt] * batch_size)
-                    unconditional_dict = {
-                        key: value.detach()
-                        for key, value in unconditional_dict.items()
-                    }
-                    self.unconditional_dict = unconditional_dict
-                else:
-                    unconditional_dict = self.unconditional_dict
+                clean_latent = self.model.vae.encode_to_latent(
+                    frames).to(device=self.device, dtype=self.dtype)
+        image_latent = clean_latent[:, 0:1, ]
 
-            should_sync = micro_index + 1 == self.gradient_accumulation_steps
-            sync_context = (
-                nullcontext() if should_sync else self.model.generator.no_sync()
-            )
-            with sync_context:
-                generator_loss, _ = self.model.generator_loss(
-                    image_or_video_shape=image_or_video_shape,
-                    conditional_dict=conditional_dict,
-                    unconditional_dict=unconditional_dict,
-                    clean_latent=clean_latent,
-                    initial_latent=image_latent,
-                )
-                if not bool(torch.isfinite(generator_loss)):
-                    raise FloatingPointError(
-                        f"non-finite generator loss at micro-batch {micro_index}"
-                    )
-                (generator_loss / self.gradient_accumulation_steps).backward()
-            accumulated_loss += generator_loss.detach().float()
+        batch_size = len(text_prompts)
+        image_or_video_shape = list(self.config.image_or_video_shape)
+        image_or_video_shape[0] = batch_size
 
-        generator_loss = accumulated_loss / self.gradient_accumulation_steps
+        # Step 2: Extract the conditional infos
+        with torch.no_grad():
+            conditional_dict = self.model.text_encoder(
+                text_prompts=text_prompts)
+            if not getattr(self, "unconditional_dict", None):
+                unconditional_dict = self.model.text_encoder(
+                    text_prompts=[self.config.negative_prompt] * batch_size)
+                unconditional_dict = {k: v.detach()
+                                      for k, v in unconditional_dict.items()}
+                self.unconditional_dict = unconditional_dict  # cache the unconditional_dict
+            else:
+                unconditional_dict = self.unconditional_dict
+
+        # Step 3: Train the generator
+        generator_loss, log_dict = self.model.generator_loss(
+            image_or_video_shape=image_or_video_shape,
+            conditional_dict=conditional_dict,
+            unconditional_dict=unconditional_dict,
+            clean_latent=clean_latent,
+            initial_latent=image_latent
+        )
+        self.generator_optimizer.zero_grad()
+        generator_loss.backward()
         generator_grad_norm = self.model.generator.clip_grad_norm_(
             self.max_grad_norm)
-        if not bool(torch.isfinite(generator_grad_norm)):
-            raise FloatingPointError("non-finite generator gradient norm")
         self.generator_optimizer.step()
 
+        # Increment the step since we finished gradient update
         self.step += 1
-        generator_loss_value = generator_loss.item()
-        generator_grad_norm_value = generator_grad_norm.item()
+
         wandb_loss_dict = {
-            "generator_loss": generator_loss_value,
-            "generator_grad_norm": generator_grad_norm_value,
+            "generator_loss": generator_loss.item(),
+            "generator_grad_norm": generator_grad_norm.item(),
         }
 
+        # Step 4: Logging
         if self.is_main_process:
-            if self.step == 1 or self.step % int(self.config.log_iters) == 0:
-                print(
-                    "AR_TEACHER_TRAIN_STEP:"
-                    f"step={self.step}:loss={generator_loss_value:.8f}:"
-                    f"grad_norm={generator_grad_norm_value:.8f}:"
-                    f"micro_batches={self.gradient_accumulation_steps}"
-                )
             if not self.disable_wandb:
                 wandb.log(wandb_loss_dict, step=self.step)
 
@@ -316,6 +275,7 @@ class Trainer:
             if dist.get_rank() == 0:
                 logging.info("DistGarbageCollector: Running GC.")
             gc.collect()
+
 
     def train(self):
         configured_save_steps = getattr(self.config, "save_steps", None)
@@ -327,11 +287,8 @@ class Trainer:
         last_saved_step = -1
 
         while max_steps <= 0 or self.step < max_steps:
-            micro_batches = [
-                next(self.dataloader)
-                for _ in range(self.gradient_accumulation_steps)
-            ]
-            self.train_one_step(micro_batches)
+            batch = next(self.dataloader)
+            self.train_one_step(batch)
 
             should_save = (
                 self.step in save_steps

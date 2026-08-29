@@ -63,8 +63,8 @@ config = OmegaConf.load(config_path)
 world_size = int(nnodes) * int(nproc_per_node)
 
 expected = {
-    8: {"sharding_strategy": "full", "gradient_accumulation_steps": 2},
-    16: {"sharding_strategy": "hybrid_full", "gradient_accumulation_steps": 1},
+    8: {"sharding_strategy": "full"},
+    16: {"sharding_strategy": "hybrid_full"},
 }
 if world_size not in expected:
     raise SystemExit(f"UNSUPPORTED_WORLD_SIZE:{world_size}")
@@ -72,26 +72,25 @@ if world_size not in expected:
 contract = expected[world_size]
 micro_batch = int(config.batch_size)
 accumulation = int(getattr(config, "gradient_accumulation_steps", 1))
-global_batch = world_size * micro_batch * accumulation
+global_batch = world_size * micro_batch
 configured_global_batch = int(config.total_batch_size)
 sharding = str(config.sharding_strategy)
 
 if micro_batch != 1:
     raise SystemExit(f"MICRO_BATCH_MISMATCH:actual={micro_batch}:expected=1")
-if accumulation != contract["gradient_accumulation_steps"]:
+if accumulation != 1:
     raise SystemExit(
-        "GRADIENT_ACCUMULATION_MISMATCH:"
-        f"actual={accumulation}:expected={contract['gradient_accumulation_steps']}"
+        f"UNSUPPORTED_GRADIENT_ACCUMULATION:actual={accumulation}:expected=1"
     )
 if sharding != contract["sharding_strategy"]:
     raise SystemExit(
         f"SHARDING_STRATEGY_MISMATCH:actual={sharding}:"
         f"expected={contract['sharding_strategy']}"
     )
-if global_batch != configured_global_batch or global_batch != 16:
+if global_batch != configured_global_batch:
     raise SystemExit(
         "WORLD_SIZE_GLOBAL_BATCH_MISMATCH:"
-        f"actual={global_batch}:configured={configured_global_batch}:expected=16"
+        f"actual={global_batch}:configured={configured_global_batch}"
     )
 
 print(

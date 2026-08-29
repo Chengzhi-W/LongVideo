@@ -34,9 +34,9 @@ instead of 162 (`clean81 + noisy36`, a 27.8% reduction in sequence-dependent
 activations). The nine-pattern bank is exactly balanced: every chunk appears in
 four patterns, and each rank randomly chooses a pattern every step.
 
-Twelve targets is intentionally not a tiny sample. With global batch 16 it
-provides 192 supervised chunks per optimizer step while bounding the number of
-FlexAttention masks compiled by each rank.
+Twelve targets is intentionally not a tiny sample. It provides 96 supervised
+chunks per optimizer step on 8 GPUs, or 192 on 16 GPUs, while bounding the
+number of FlexAttention masks compiled by each rank.
 
 ## Data and launch
 
@@ -75,6 +75,6 @@ python tools/audit_sparse_teacher_forcing_20s.py \
 
 Use `tools/run_ar_teacher_sparse12_20s_smoke_1gpu.sh` for the two-step GPU
 smoke test. Production uses `tools/run_ar_teacher_sparse12_20s.sh`: it defaults
-to one node with 8 GPUs (`full` FSDP, accumulation 2) and switches to two nodes
-with 8 GPUs each (`hybrid_full`, accumulation 1) when `NNODES=2`. Both execute
-one optimizer update per effective global batch of 16.
+to one node with 8 GPUs (`full` FSDP, global batch 8) and switches to two nodes
+with 8 GPUs each (`hybrid_full`, global batch 16) when `NNODES=2`. Neither path
+uses gradient accumulation.

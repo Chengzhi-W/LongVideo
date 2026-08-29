@@ -80,13 +80,13 @@ ULTRAVIDEO_20S_DATA_AUDIT_OK:count=4900
 
 The production launcher performs a fast sampled data audit again before any
 distributed model process starts. It supports exactly the two reviewed
-topologies below; both preserve effective global batch 16 and learning rate
-`2e-6`:
+topologies below. Both use one batch per optimizer update with no gradient
+accumulation and learning rate `2e-6`:
 
-| Hardware | Config selected automatically | FSDP | Accumulation |
+| Hardware | Config selected automatically | FSDP | Global batch |
 |---|---|---|---:|
-| 1 × 8 GPUs | `ar_teacher_ultravideo_long_5k_81f_sparse12_8gpu.yaml` | `full` | 2 |
-| 2 × 8 GPUs | `ar_teacher_ultravideo_long_5k_81f_sparse12.yaml` | `hybrid_full` | 1 |
+| 1 × 8 GPUs | `ar_teacher_ultravideo_long_5k_81f_sparse12_8gpu.yaml` | `full` | 8 |
+| 2 × 8 GPUs | `ar_teacher_ultravideo_long_5k_81f_sparse12.yaml` | `hybrid_full` | 16 |
 
 Single-node 8-GPU launch:
 
@@ -103,8 +103,9 @@ NNODES=2 NODE_RANK=... MASTER_ADDR=... \
 ```
 
 Set `DRY_RUN=1` on either command to validate topology, config, global batch,
-accumulation, sharding, and the sparse attention contract without requiring the
-dataset or checkpoint. Unsupported layouts fail before training starts.
+absence of gradient accumulation, sharding, and the sparse attention contract
+without requiring the dataset or checkpoint. Unsupported layouts fail before
+training starts.
 
 Never manually copy an LMDB from another run into this root. The encode-plan
 digest is carried into LMDB metadata specifically to detect that mistake.
